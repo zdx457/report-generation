@@ -1,0 +1,29 @@
+services:
+  rag-web:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: report-generation
+    ports:
+      - "${HOST_PORT:-7860}:7860"
+    volumes:
+      - ./rag/milvus_lite.db:/app/rag/milvus_lite.db
+      - ./rag/xlsx_slices:/app/rag/xlsx_slices
+      - ./rag/report_template:/app/rag/report_template
+    env_file:
+      - .env
+    environment:
+      - GRADIO_SERVER_NAME=0.0.0.0
+      - GRADIO_SERVER_PORT=7860
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7860/"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
