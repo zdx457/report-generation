@@ -51,6 +51,7 @@ init_dirs() {
     mkdir -p rag/milvus_lite.db
     mkdir -p rag/xlsx_slices
     mkdir -p rag/report_template
+    chown -R 1000:1000 rag/milvus_lite.db rag/xlsx_slices rag/report_template
     info "数据目录已就绪"
 }
 
@@ -104,6 +105,7 @@ case "${1:-start}" in
         ;;
     restart)
         stop_service
+        init_dirs
         build_and_start
         ;;
     rebuild)
