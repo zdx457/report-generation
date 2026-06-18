@@ -21,4 +21,4 @@ EXPOSE 7860
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:7860/ || exit 1
 
-CMD ["python", "rag/rag_web.py"]
+CMD ["python", "rag/web.py"]

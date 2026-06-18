@@ -1,8 +1,8 @@
 """RAG 问答：用户提问 → 向量检索 → Qwen 生成回答。
 
 用法示例：
-  python rag_chat.py
-  python rag_chat.py --top-k 5
+  python chat.py
+  python chat.py --top-k 5
 """
 import json
 import os
@@ -18,7 +18,7 @@ CHAT_MODEL = os.environ.get("CHAT_MODEL", "qwen36_27b_lora")
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "milvus_lite.db")
 COLLECTION_NAME = "report_slices"
 
-PROMPT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rag_prompt.md")
+PROMPT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompt.md")
 
 
 def load_system_prompt():

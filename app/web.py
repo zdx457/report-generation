@@ -1,10 +1,10 @@
 """RAG 问答 Web 界面（Gradio）。
 
 用法示例：
-  python rag_web.py
-  python rag_web.py --share          # 生成公网链接
-  python rag_web.py --top-k 5        # 调整检索数量
-  python rag_web.py --debug          # 显示检索详情
+  python web.py
+  python web.py --share          # 生成公网链接
+  python web.py --top-k 5        # 调整检索数量
+  python web.py --debug          # 显示检索详情
 """
 import json
 import os
@@ -27,14 +27,14 @@ REPORT_TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "
 XLSX_SLICES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xlsx_slices")
 EMBED_DIM = 1024
 
-PROMPT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rag_prompt.md")
+PROMPT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompt.md")
 
 
 def load_system_prompt():
     if os.path.exists(PROMPT_FILE):
         with open(PROMPT_FILE, "r", encoding="utf-8") as f:
             return f.read().strip()
-    return "你是一个医疗影像报告分析助手。请根据检索到的参考信息回答用户问题。如果参考信息不足以回答问题，请如实说明。"
+    return "你是一个医疗影像报告生成助手。请根据检索到的参考信息回答用户问题。如果参考信息不足以回答问题，请如实说明。"
 
 
 SYSTEM_PROMPT = load_system_prompt()
@@ -352,8 +352,8 @@ def rag_respond(message, history, top_k, temperature):
 
 
 def build_ui():
-    with gr.Blocks(title="医疗影像报告 RAG 问答") as demo:
-        gr.Markdown("# 🏥 医疗影像报告 RAG 问答系统")
+    with gr.Blocks(title="医疗影像报告生成") as demo:
+        gr.Markdown("# 🏥 医疗影像报告生成系统")
         gr.Markdown(
             f"Embedding: `{EMBED_MODEL}` | 生成模型: `{CHAT_MODEL}`"
         )
