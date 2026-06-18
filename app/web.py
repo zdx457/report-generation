@@ -323,6 +323,7 @@ def rag_respond(message, history, top_k, temperature):
 
     thinking_html = "<details><summary>🧠 思考过程</summary>\n"
     thinking_html += "<div style='padding:8px;background:#f8f9fa;border-radius:6px;font-size:14px;'>\n"
+
     thinking_html += "<p><b>🔍 第一步：向量检索</b>（top-{}）</p>\n".format(top_k)
     for ref in ref_details:
         thinking_html += (
@@ -333,17 +334,31 @@ def rag_respond(message, history, top_k, temperature):
             "<details><summary>查看全文</summary><pre style='white-space:pre-wrap;'>{text}</pre></details>"
             "</div>\n"
         ).format(**ref)
-    thinking_html += "</div>\n</details>\n"
-
-    yield thinking_html
 
     context_text = "\n\n".join(contexts)
     user_message = f"参考信息：\n{context_text}\n\n用户问题：{message}"
-
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_message},
     ]
+
+    thinking_html += "<p><b>📝 第二步：构造提示词</b></p>\n"
+    thinking_html += "<div style='margin-left:16px;margin-bottom:8px;'>\n"
+    thinking_html += "<details><summary>System Prompt</summary><pre style='white-space:pre-wrap;'>{}</pre></details>\n".format(
+        SYSTEM_PROMPT.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    )
+    thinking_html += "<details><summary>User Prompt</summary><pre style='white-space:pre-wrap;'>{}</pre></details>\n".format(
+        user_message.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    )
+    thinking_html += "</div>\n"
+
+    thinking_html += "<p><b>🤖 第三步：LLM 生成报告</b></p>\n"
+    thinking_html += "<div style='margin-left:16px;margin-bottom:8px;'>"
+    thinking_html += "模型: <code>{}</code> | 温度: {}</div>\n".format(CHAT_MODEL, temperature)
+
+    thinking_html += "</div>\n</details>\n"
+
+    yield thinking_html
 
     partial_reply = ""
     for chunk in chat_stream(messages, temperature=temperature):
@@ -352,7 +367,9 @@ def rag_respond(message, history, top_k, temperature):
 
 
 def build_ui():
-    with gr.Blocks(title="医疗影像报告生成") as demo:
+    with gr.Blocks(title="医疗影像报告生成", css="""
+        .chatbot .message { font-size: 16px; line-height: 1.6; }
+    """) as demo:
         gr.Markdown("# 🏥 医疗影像报告生成系统")
         gr.Markdown(
             f"Embedding: `{EMBED_MODEL}` | 生成模型: `{CHAT_MODEL}`"
@@ -360,10 +377,10 @@ def build_ui():
 
         with gr.Row():
             with gr.Column(scale=3):
-                chatbot = gr.Chatbot(height=500, sanitize_html=False)
+                chatbot = gr.Chatbot(height=800, sanitize_html=False)
                 with gr.Row():
                     msg_input = gr.Textbox(
-                        placeholder="输入问题，如：CT弥漫性肺气肿的影像学表现",
+                        placeholder="输入问题，如：CT弥漫性肺气肿",
                         show_label=False,
                         scale=4,
                     )
@@ -372,7 +389,7 @@ def build_ui():
 
             with gr.Column(scale=1):
                 gr.Markdown("### 参数设置")
-                top_k = gr.Slider(1, 10, value=3, step=1, label="检索数量 (Top-K)")
+                top_k = gr.Slider(1, 10, value=1, step=1, label="检索数量 (Top-K)")
                 temperature = gr.Slider(0.1, 1.0, value=0.7, step=0.1, label="温度 (Temperature)")
 
                 gr.Markdown("---")
