@@ -14,13 +14,19 @@ import time
 
 import gradio as gr
 import requests
+from dotenv import load_dotenv
 from openpyxl import load_workbook
 from pymilvus import CollectionSchema, DataType, FieldSchema, MilvusClient
+
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env"))
 
 EMBED_URL = os.environ.get("EMBED_URL", "http://14.22.83.225:11002/v1/embeddings")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "bge-m3")
 CHAT_URL = os.environ.get("CHAT_URL", "http://14.22.86.97:11001/v1/chat/completions")
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "qwen36_27b_lora")
+RERANK_URL = os.environ.get("RERANK_URL", "https://api.siliconflow.cn/v1/rerank")
+RERANK_MODEL = os.environ.get("RERANK_MODEL", "Qwen/Qwen3-VL-Reranker-8B")
+SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY", "")
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "milvus_lite.db")
 COLLECTION_NAME = "report_slices"
 REPORT_TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "report_template")
@@ -58,6 +64,23 @@ def search(query_vector, top_k=3):
         output_fields=["text", "source", "检查类型", "部位", "检查项目", "诊断结论"],
     )
     return results[0]
+
+
+def rerank_documents(query, documents, top_n=3):
+    headers = {"Content-Type": "application/json"}
+    if SILICONFLOW_API_KEY:
+        headers["Authorization"] = f"Bearer {SILICONFLOW_API_KEY}"
+    payload = {
+        "model": RERANK_MODEL,
+        "query": query,
+        "documents": documents,
+        "top_n": top_n,
+        "return_documents": True,
+    }
+    r = requests.post(RERANK_URL, headers=headers, json=payload, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    return data.get("results", [])
 
 
 def _xlsx_to_slices(filepath):
@@ -300,20 +323,43 @@ def chat_stream(messages, max_tokens=1024, temperature=0.7):
                 pass
 
 
-def rag_respond(message, history, top_k, temperature):
+def rag_respond(message, history, top_k, rerank_top_k, temperature):
     query_vec = get_embedding(message)
     hits = search(query_vec, top_k=top_k)
 
+    hit_entities = []
+    for hit in hits:
+        entity = hit["entity"]
+        entity["_distance"] = hit.get("distance", 0)
+        hit_entities.append(entity)
+
+    documents = [e["text"] for e in hit_entities]
+
+    reranked_entities = []
+    try:
+        rerank_results = rerank_documents(message, documents, top_n=rerank_top_k)
+        for rr in rerank_results:
+            idx = rr.get("index", 0)
+            rerank_score = rr.get("relevance_score", 0)
+            entity = hit_entities[idx]
+            entity["_rerank_score"] = rerank_score
+            reranked_entities.append(entity)
+    except Exception as e:
+        reranked_entities = hit_entities[:rerank_top_k]
+        for entity in reranked_entities:
+            entity["_rerank_score"] = -1
+
     contexts = []
     ref_details = []
-    for i, hit in enumerate(hits, 1):
-        entity = hit["entity"]
-        score = hit.get("distance", 0)
+    for i, entity in enumerate(reranked_entities, 1):
+        vec_score = entity.get("_distance", 0)
+        rerank_score = entity.get("_rerank_score", 0)
         contexts.append(f"【参考{i}】(来源: {entity['source']})\n{entity['text']}")
         ref_details.append({
             "index": i,
             "source": entity["source"],
-            "score": f"{score:.4f}",
+            "vec_score": f"{vec_score:.4f}",
+            "rerank_score": f"{rerank_score:.4f}",
             "检查类型": entity.get("检查类型", ""),
             "部位": entity.get("部位", ""),
             "检查项目": entity.get("检查项目", ""),
@@ -325,10 +371,23 @@ def rag_respond(message, history, top_k, temperature):
     thinking_html += "<div style='padding:8px;background:#f8f9fa;border-radius:6px;font-size:14px;'>\n"
 
     thinking_html += "<p><b>🔍 第一步：向量检索</b>（top-{}）</p>\n".format(top_k)
+    for i, hit in enumerate(hits, 1):
+        entity = hit["entity"]
+        score = hit.get("distance", 0)
+        thinking_html += (
+            "<div style='margin-left:16px;margin-bottom:4px;'>"
+            "检索{i} · 相似度: {score:.4f} · 来源: <code>{source}</code></div>\n"
+        ).format(i=i, score=score, source=entity["source"])
+
+    thinking_html += "<p><b>🔄 第二步：Rerank 重排序</b>（top-{}）</p>\n".format(rerank_top_k)
+    thinking_html += "<div style='margin-left:16px;font-size:12px;color:#666;'>模型: <code>{}</code></div>\n".format(RERANK_MODEL)
+    rerank_failed = any(ref["rerank_score"] == "-1.0000" for ref in ref_details)
+    if rerank_failed:
+        thinking_html += "<div style='margin-left:16px;font-size:12px;color:#e74c3c;'>⚠️ Rerank 调用失败，已降级为向量检索结果</div>\n"
     for ref in ref_details:
         thinking_html += (
             "<div style='margin-left:16px;margin-bottom:8px;'>"
-            "<b>参考{index}</b> · 相似度: {score} · 来源: <code>{source}</code><br>"
+            "<b>参考{index}</b> · 向量相似度: {vec_score} · Rerank分数: {rerank_score} · 来源: <code>{source}</code><br>"
             "检查类型: {检查类型} | 部位: {部位} | 检查项目: {检查项目}<br>"
             "诊断结论: {诊断结论}<br>"
             "<details><summary>查看全文</summary><pre style='white-space:pre-wrap;'>{text}</pre></details>"
@@ -342,7 +401,7 @@ def rag_respond(message, history, top_k, temperature):
         {"role": "user", "content": user_message},
     ]
 
-    thinking_html += "<p><b>📝 第二步：构造提示词</b></p>\n"
+    thinking_html += "<p><b>📝 第三步：构造提示词</b></p>\n"
     thinking_html += "<div style='margin-left:16px;margin-bottom:8px;'>\n"
     thinking_html += "<details><summary>System Prompt</summary><pre style='white-space:pre-wrap;'>{}</pre></details>\n".format(
         SYSTEM_PROMPT.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -352,7 +411,7 @@ def rag_respond(message, history, top_k, temperature):
     )
     thinking_html += "</div>\n"
 
-    thinking_html += "<p><b>🤖 第三步：LLM 生成报告</b></p>\n"
+    thinking_html += "<p><b>🤖 第四步：LLM 生成报告</b></p>\n"
     thinking_html += "<div style='margin-left:16px;margin-bottom:8px;'>"
     thinking_html += "模型: <code>{}</code> | 温度: {}</div>\n".format(CHAT_MODEL, temperature)
 
@@ -372,7 +431,7 @@ def build_ui():
     """) as demo:
         gr.Markdown("# 🏥 医疗影像报告生成系统")
         gr.Markdown(
-            f"Embedding: `{EMBED_MODEL}` | 生成模型: `{CHAT_MODEL}`"
+            f"Embedding: `{EMBED_MODEL}` | Rerank: `{RERANK_MODEL}` | 生成模型: `{CHAT_MODEL}`"
         )
 
         with gr.Row():
@@ -389,7 +448,8 @@ def build_ui():
 
             with gr.Column(scale=1):
                 gr.Markdown("### 参数设置")
-                top_k = gr.Slider(1, 10, value=1, step=1, label="检索数量 (Top-K)")
+                top_k = gr.Slider(1, 20, value=5, step=1, label="向量检索数量 (Top-K)")
+                rerank_top_k = gr.Slider(1, 10, value=1, step=1, label="Rerank 返回数量 (Top-K)")
                 temperature = gr.Slider(0.1, 1.0, value=0.7, step=0.1, label="温度 (Temperature)")
 
                 gr.Markdown("---")
@@ -402,9 +462,9 @@ def build_ui():
                 upload_btn = gr.Button("上传并处理", variant="secondary")
                 upload_status = gr.Textbox(label="处理状态", interactive=False, lines=5)
 
-        def respond(message, history, top_k_val, temp_val):
+        def respond(message, history, top_k_val, rerank_top_k_val, temp_val):
             reply_text = ""
-            for partial in rag_respond(message, history, top_k_val, temp_val):
+            for partial in rag_respond(message, history, top_k_val, rerank_top_k_val, temp_val):
                 reply_text = partial
                 display = history + [
                     {"role": "user", "content": message},
@@ -417,13 +477,13 @@ def build_ui():
 
         msg_input.submit(
             respond,
-            inputs=[msg_input, chatbot, top_k, temperature],
+            inputs=[msg_input, chatbot, top_k, rerank_top_k, temperature],
             outputs=[chatbot],
         ).then(lambda: "", outputs=msg_input)
 
         send_btn.click(
             respond,
-            inputs=[msg_input, chatbot, top_k, temperature],
+            inputs=[msg_input, chatbot, top_k, rerank_top_k, temperature],
             outputs=[chatbot],
         ).then(lambda: "", outputs=msg_input)
 
@@ -447,7 +507,7 @@ def main():
             top_k_default = int(arg.split("=")[1])
 
     demo = build_ui()
-    server_name = os.environ.get("GRADIO_SERVER_NAME", "0.0.0.0")
+    server_name = os.environ.get("GRADIO_SERVER_NAME", "127.0.0.1")
     server_port = int(os.environ.get("GRADIO_SERVER_PORT", "7860"))
     demo.launch(share=share, debug=debug, theme=gr.themes.Soft(), server_name=server_name, server_port=server_port)
 

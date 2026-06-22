@@ -9,16 +9,22 @@ import os
 import sys
 
 import requests
+from dotenv import load_dotenv
 from pymilvus import MilvusClient
+
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env"))
 
 EMBED_URL = os.environ.get("EMBED_URL", "http://14.22.83.225:11002/v1/embeddings")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "bge-m3")
 CHAT_URL = os.environ.get("CHAT_URL", "http://14.22.86.97:11001/v1/chat/completions")
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "qwen36_27b_lora")
+RERANK_URL = os.environ.get("RERANK_URL", "https://api.siliconflow.cn/v1/rerank")
+RERANK_MODEL = os.environ.get("RERANK_MODEL", "Qwen/Qwen3-VL-Reranker-8B")
+SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY", "")
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "milvus_lite.db")
 COLLECTION_NAME = "report_slices"
 
-PROMPT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "rag_prompt.md")
+PROMPT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prompt.md")
 
 
 def load_system_prompt():
@@ -47,6 +53,23 @@ def search(query_vector, top_k=3, filter_expr=""):
     )
     client.close()
     return results[0]
+
+
+def rerank_documents(query, documents, top_n=3):
+    headers = {"Content-Type": "application/json"}
+    if SILICONFLOW_API_KEY:
+        headers["Authorization"] = f"Bearer {SILICONFLOW_API_KEY}"
+    payload = {
+        "model": RERANK_MODEL,
+        "query": query,
+        "documents": documents,
+        "top_n": top_n,
+        "return_documents": True,
+    }
+    r = requests.post(RERANK_URL, headers=headers, json=payload, timeout=30)
+    r.raise_for_status()
+    data = r.json()
+    return data.get("results", [])
 
 
 def chat_stream(messages, max_tokens=1024, temperature=0.7):
@@ -86,7 +109,7 @@ def chat_stream(messages, max_tokens=1024, temperature=0.7):
     return full_reply
 
 
-def rag_query(question, top_k=3, filter_expr="", debug=False):
+def rag_query(question, top_k=3, rerank_top_k=1, filter_expr="", debug=False):
     print("检索中...", end="", flush=True)
     query_vec = get_embedding(question)
     hits = search(query_vec, top_k=top_k, filter_expr=filter_expr)
@@ -94,22 +117,53 @@ def rag_query(question, top_k=3, filter_expr="", debug=False):
 
     if debug:
         print("\n" + "=" * 60)
-        print("【检索结果 Top-{}】".format(top_k))
+        print("【向量检索结果 Top-{}】".format(top_k))
         print("=" * 60)
         for i, hit in enumerate(hits, 1):
             entity = hit["entity"]
             score = hit.get("distance", "?")
-            print(f"\n--- 参考{i} (相似度: {score}) ---")
+            print(f"\n--- 检索{i} (相似度: {score}) ---")
             print(f"来源: {entity['source']}")
             print(f"检查类型: {entity.get('检查类型', '')}")
             print(f"部位: {entity.get('部位', '')}")
             print(f"检查项目: {entity.get('检查项目', '')}")
             print(f"诊断结论: {entity.get('诊断结论', '')}")
-            print(f"全文:\n{entity['text']}")
+
+    hit_entities = []
+    for hit in hits:
+        entity = hit["entity"]
+        entity["_distance"] = hit.get("distance", 0)
+        hit_entities.append(entity)
+
+    documents = [e["text"] for e in hit_entities]
+
+    reranked_entities = []
+    try:
+        print("Rerank中...", end="", flush=True)
+        rerank_results = rerank_documents(question, documents, top_n=rerank_top_k)
+        print(" 完成")
+        for rr in rerank_results:
+            idx = rr.get("index", 0)
+            rerank_score = rr.get("relevance_score", 0)
+            entity = hit_entities[idx]
+            entity["_rerank_score"] = rerank_score
+            reranked_entities.append(entity)
+    except Exception as e:
+        print(f" Rerank失败({e})，使用向量检索结果")
+        reranked_entities = hit_entities[:rerank_top_k]
+
+    if debug:
+        print("\n" + "=" * 60)
+        print("【Rerank结果 Top-{}】".format(len(reranked_entities)))
+        print("=" * 60)
+        for i, entity in enumerate(reranked_entities, 1):
+            rerank_score = entity.get("_rerank_score", "N/A")
+            print(f"\n--- 参考{i} (Rerank: {rerank_score}) ---")
+            print(f"来源: {entity['source']}")
+            print(f"诊断结论: {entity.get('诊断结论', '')}")
 
     contexts = []
-    for i, hit in enumerate(hits, 1):
-        entity = hit["entity"]
+    for i, entity in enumerate(reranked_entities, 1):
         contexts.append(f"【参考{i}】(来源: {entity['source']})\n{entity['text']}")
 
     context_text = "\n\n".join(contexts)
@@ -137,11 +191,14 @@ def rag_query(question, top_k=3, filter_expr="", debug=False):
 
 
 def main():
-    top_k = 1
+    top_k = 5
+    rerank_top_k = 1
     debug = False
     for arg in sys.argv[1:]:
         if arg.startswith("--top-k="):
             top_k = int(arg.split("=")[1])
+        elif arg.startswith("--rerank-top-k="):
+            rerank_top_k = int(arg.split("=")[1])
         elif arg == "--debug":
             debug = True
 
@@ -151,8 +208,10 @@ def main():
 
     print("=== RAG 问答已启动 ===")
     print(f"Embedding: {EMBED_MODEL}")
+    print(f"Rerank: {RERANK_MODEL}")
     print(f"生成模型: {CHAT_MODEL}")
-    print(f"检索数量: top-{top_k}")
+    print(f"向量检索: top-{top_k}")
+    print(f"Rerank返回: top-{rerank_top_k}")
     if debug:
         print("调试模式: 开启（打印检索结果和Prompt）")
     print("输入 exit 或 quit 退出\n")
@@ -171,7 +230,7 @@ def main():
             break
 
         try:
-            rag_query(user_input, top_k=top_k, debug=debug)
+            rag_query(user_input, top_k=top_k, rerank_top_k=rerank_top_k, debug=debug)
         except Exception as e:
             print(f"（出错: {e}）")
 

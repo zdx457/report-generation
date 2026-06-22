@@ -74,7 +74,7 @@ class DeepSearcherClient:
 # 正确的测试流程
 # ============================================================
 if __name__ == "__main__":
-    BASE_URL = "http://220.154.3.166:8001/"
+    BASE_URL = "http://220.154.3.166:8001"
     client = DeepSearcherClient(BASE_URL)
 
     print("=" * 60)

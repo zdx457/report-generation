@@ -14,7 +14,10 @@ import sys
 import time
 
 import requests
+from dotenv import load_dotenv
 from pymilvus import MilvusClient
+
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env"))
 
 EMBED_URL = os.environ.get("EMBED_URL", "http://14.22.83.225:11002/v1/embeddings")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "bge-m3")
