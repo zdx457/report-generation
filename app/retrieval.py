@@ -1,0 +1,345 @@
+"""多路召回模块。
+
+支持三种召回路径，合并去重后统一交给 Rerank 精排：
+
+1. 向量检索（Bi-Encoder）：语义相似度匹配，适合模糊查询
+2. 元数据过滤：按检查类型/部位/诊断结论精确匹配，适合关键词明确的查询
+3. 关键词检索：基于 Milvus like 查询的全文匹配，适合专业术语检索
+
+用法：
+    from retrieval import multi_recall
+
+    candidates = multi_recall(
+        query="CT脑出血",
+        query_vec=[0.1, -0.2, ...],
+        top_k=5,
+        client=milvus_client,
+    )
+"""
+import os
+
+from pymilvus import MilvusClient
+
+COLLECTION_NAME = "report_slices"
+
+OUTPUT_FIELDS = ["text", "source", "检查类型", "部位", "检查项目", "诊断结论"]
+
+KNOWN_TYPES = {"CT", "MR", "DR", "MRI", "X光", "X线"}
+
+KNOWN_PARTS = {
+    "头颅", "头颈部", "胸部", "腹部", "盆腔", "脊柱",
+    "四肢及关节", "血管", "颈椎", "腰椎", "胸椎",
+}
+
+PART_ALIASES = {
+    "头": "头颅",
+    "脑": "头颅",
+    "颅脑": "头颅",
+    "头部": "头颅",
+    "颈": "头颈部",
+    "颈部": "头颈部",
+    "胸": "胸部",
+    "胸部": "胸部",
+    "胸廓": "胸部",
+    "腹": "腹部",
+    "腹部": "腹部",
+    "盆腔": "盆腔",
+    "脊柱": "脊柱",
+    "脊椎": "脊柱",
+    "四肢": "四肢及关节",
+    "关节": "四肢及关节",
+    "血管": "血管",
+}
+
+
+def parse_query_keywords(query):
+    """从用户输入中提取结构化关键词。
+
+    Args:
+        query: 用户输入的查询文本
+
+    Returns:
+        dict: 包含 检查类型, 部位, 诊断关键词 等字段
+    """
+    keywords = {
+        "检查类型": "",
+        "部位": "",
+        "诊断关键词": [],
+    }
+
+    for t in KNOWN_TYPES:
+        if t in query:
+            keywords["检查类型"] = t
+            break
+
+    if "MRI" in query and not keywords["检查类型"]:
+        keywords["检查类型"] = "MR"
+
+    for alias, standard in PART_ALIASES.items():
+        if alias in query:
+            keywords["部位"] = standard
+            break
+
+    if not keywords["部位"]:
+        for part in KNOWN_PARTS:
+            if part in query:
+                keywords["部位"] = part
+                break
+
+    cleaned = query
+    for t in KNOWN_TYPES:
+        cleaned = cleaned.replace(t, "")
+    if keywords["部位"]:
+        for alias, standard in PART_ALIASES.items():
+            if standard == keywords["部位"]:
+                cleaned = cleaned.replace(alias, "")
+    cleaned = cleaned.strip()
+
+    if cleaned and len(cleaned) >= 2:
+        keywords["诊断关键词"] = [cleaned]
+
+    return keywords
+
+
+def vector_search(query_vec, top_k, client):
+    """向量检索（Bi-Encoder 语义匹配）。
+
+    Args:
+        query_vec: 查询向量 (1024维)
+        top_k: 返回数量
+        client: MilvusClient 实例
+
+    Returns:
+        list[dict]: 候选文档列表，每项包含 text, source, 元数据, _distance, _recall_path
+    """
+    results = client.search(
+        collection_name=COLLECTION_NAME,
+        data=[query_vec],
+        limit=top_k,
+        output_fields=OUTPUT_FIELDS,
+    )
+
+    candidates = []
+    for hit in results[0]:
+        entity = hit["entity"]
+        entity["_distance"] = hit.get("distance", 0)
+        entity["_recall_path"] = "vector"
+        candidates.append(entity)
+    return candidates
+
+
+def metadata_filter(keywords, top_k, client):
+    """元数据过滤（按检查类型/部位/诊断结论精确匹配）。
+
+    Args:
+        keywords: parse_query_keywords 返回的关键词字典
+        top_k: 返回数量
+        client: MilvusClient 实例
+
+    Returns:
+        list[dict]: 候选文档列表
+    """
+    conditions = []
+
+    if keywords.get("检查类型"):
+        check_type = keywords["检查类型"]
+        if check_type == "MRI":
+            check_type = "MR"
+        conditions.append(f'检查类型 == "{check_type}"')
+
+    if keywords.get("部位"):
+        conditions.append(f'部位 == "{keywords["部位"]}"')
+
+    if keywords.get("诊断关键词"):
+        for kw in keywords["诊断关键词"]:
+            conditions.append(f'诊断结论 like "%{kw}%"')
+
+    if not conditions:
+        return []
+
+    filter_expr = " and ".join(conditions)
+
+    try:
+        client.load_collection(COLLECTION_NAME)
+        results = client.query(
+            COLLECTION_NAME,
+            filter=filter_expr,
+            output_fields=OUTPUT_FIELDS,
+            limit=top_k,
+        )
+    except Exception:
+        return []
+
+    candidates = []
+    for r in results:
+        r["_distance"] = -1
+        r["_recall_path"] = "metadata"
+        candidates.append(r)
+    return candidates
+
+
+def keyword_search(query, top_k, client):
+    """关键词检索（基于 Milvus like 查询的全文匹配）。
+
+    对用户输入中的关键片段进行 like 匹配，
+    适合用户输入包含专业术语的场景。
+
+    Args:
+        query: 用户查询文本
+        top_k: 返回数量
+        client: MilvusClient 实例
+
+    Returns:
+        list[dict]: 候选文档列表
+    """
+    keywords = parse_query_keywords(query)
+    search_terms = []
+
+    if keywords.get("诊断关键词"):
+        search_terms.extend(keywords["诊断关键词"])
+
+    if not search_terms:
+        return []
+
+    all_conditions = []
+    for term in search_terms:
+        all_conditions.append(f'text like "%{term}%"')
+
+    if not all_conditions:
+        return []
+
+    filter_expr = " or ".join(all_conditions)
+
+    type_cond = ""
+    if keywords.get("检查类型"):
+        ct = keywords["检查类型"]
+        if ct == "MRI":
+            ct = "MR"
+        type_cond = f'检查类型 == "{ct}"'
+
+    if type_cond:
+        filter_expr = f"({filter_expr}) and {type_cond}"
+
+    try:
+        client.load_collection(COLLECTION_NAME)
+        results = client.query(
+            COLLECTION_NAME,
+            filter=filter_expr,
+            output_fields=OUTPUT_FIELDS,
+            limit=top_k,
+        )
+    except Exception:
+        return []
+
+    candidates = []
+    for r in results:
+        r["_distance"] = -1
+        r["_recall_path"] = "keyword"
+        candidates.append(r)
+    return candidates
+
+
+def multi_recall(query, query_vec, top_k, client, recall_paths=None):
+    """多路召回 + 去重。
+
+    Args:
+        query: 用户查询文本
+        query_vec: 查询向量 (1024维)
+        top_k: 每路召回的数量
+        client: MilvusClient 实例
+        recall_paths: 启用的召回路径列表，默认 ["vector", "metadata", "keyword"]
+
+    Returns:
+        list[dict]: 去重后的候选文档列表，每项包含:
+            - text, source, 元数据
+            - _distance: 向量检索距离（-1 表示非向量检索）
+            - _recall_path: 召回路径（"vector"/"metadata"/"keyword"/"multi"）
+            - _recall_paths: 所有命中该文档的召回路径列表
+    """
+    if recall_paths is None:
+        recall_paths = ["vector", "metadata", "keyword"]
+
+    keywords = parse_query_keywords(query)
+
+    candidates = {}
+
+    if "vector" in recall_paths:
+        vec_results = vector_search(query_vec, top_k, client)
+        for entity in vec_results:
+            src = entity["source"]
+            if src in candidates:
+                candidates[src]["_recall_paths"].append("vector")
+            else:
+                entity["_recall_paths"] = ["vector"]
+                candidates[src] = entity
+
+    if "metadata" in recall_paths:
+        meta_results = metadata_filter(keywords, top_k, client)
+        for entity in meta_results:
+            src = entity["source"]
+            if src in candidates:
+                candidates[src]["_recall_paths"].append("metadata")
+            else:
+                entity["_recall_paths"] = ["metadata"]
+                candidates[src] = entity
+
+    if "keyword" in recall_paths:
+        kw_results = keyword_search(query, top_k, client)
+        for entity in kw_results:
+            src = entity["source"]
+            if src in candidates:
+                candidates[src]["_recall_paths"].append("keyword")
+            else:
+                entity["_recall_paths"] = ["keyword"]
+                candidates[src] = entity
+
+    result = list(candidates.values())
+    for entity in result:
+        if len(entity["_recall_paths"]) > 1:
+            entity["_recall_path"] = "multi"
+        else:
+            entity["_recall_path"] = entity["_recall_paths"][0]
+
+    return result
+
+
+if __name__ == "__main__":
+    import requests as http_requests
+
+    DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "milvus_lite.db")
+    EMBED_URL = os.environ.get("EMBED_URL", "http://14.22.83.225:11002/v1/embeddings")
+    EMBED_MODEL = os.environ.get("EMBED_MODEL", "bge-m3")
+
+    test_queries = ["CT脑出血", "动脉瘤（宽颈多发）", "头颅", "CT"]
+
+    client = MilvusClient(uri=DB_PATH)
+    client.load_collection(COLLECTION_NAME)
+
+    for q in test_queries:
+        print(f"\n{'='*60}")
+        print(f"查询: {q}")
+        print(f"{'='*60}")
+
+        keywords = parse_query_keywords(q)
+        print(f"  解析关键词: {keywords}")
+
+        payload = {"model": EMBED_MODEL, "input": [q]}
+        resp = http_requests.post(EMBED_URL, json=payload, timeout=30)
+        query_vec = resp.json()["data"][0]["embedding"]
+
+        candidates = multi_recall(q, query_vec, top_k=5, client=client)
+
+        path_counts = {}
+        for c in candidates:
+            path = c["_recall_path"]
+            path_counts[path] = path_counts.get(path, 0) + 1
+
+        print(f"  总候选数: {len(candidates)} (去重后)")
+        print(f"  召回路径分布: {path_counts}")
+
+        for i, c in enumerate(candidates[:5], 1):
+            print(f"\n  候选{i}: 来源={c['source']}")
+            print(f"        路径={c['_recall_path']} ({', '.join(c['_recall_paths'])})")
+            print(f"        类型={c.get('检查类型','')} | 部位={c.get('部位','')} | 诊断={c.get('诊断结论','')}")
+
+    client.close()

@@ -19,6 +19,11 @@ from openpyxl import load_workbook
 from pymilvus import CollectionSchema, DataType, FieldSchema, MilvusClient
 
 from rerank import get_rerank_config, rerank_documents
+from retrieval import (
+    multi_recall, parse_query_keywords,
+    vector_search, metadata_filter, keyword_search,
+)
+from query_rewrite import rewrite_query, needs_rewrite, is_too_vague, get_clarification
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env"))
 
@@ -305,20 +310,187 @@ def chat_stream(messages, max_tokens=1024, temperature=0.7):
                 pass
 
 
+def _esc(s):
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+class StepCounter:
+    def __init__(self):
+        self.n = 0
+
+    def next(self, title, status=""):
+        self.n += 1
+        status_str = f" {status}" if status else ""
+        return f"<p><b>{self.n}. {title}</b>{status_str}</p>\n"
+
+
 def rag_respond(message, history, top_k, rerank_top_k, temperature):
     if rerank_top_k > top_k:
         rerank_top_k = top_k
 
-    query_vec = get_embedding(message)
-    hits = search(query_vec, top_k=top_k)
+    step = StepCounter()
 
-    hit_entities = []
-    for hit in hits:
-        entity = hit["entity"]
-        entity["_distance"] = hit.get("distance", 0)
-        hit_entities.append(entity)
+    if is_too_vague(message):
+        clarification = get_clarification(message)
+        thinking_html = "<details open><summary>⚠️ 查询过于模糊</summary>\n"
+        thinking_html += "<div style='font-size:14px;'>\n"
+        thinking_html += "<p><b>您的输入过于模糊，请补充检查部位或诊断信息：</b></p>\n"
+        for line in clarification.split("\n"):
+            thinking_html += f"<div style='margin-left:16px;'>{line}</div>\n"
+        thinking_html += "</div>\n</details>\n"
+        yield thinking_html
+        return
 
-    documents = [e["text"] for e in hit_entities]
+    thinking_html = "<details open><summary>🧠 思考过程</summary>\n"
+    thinking_html += "<div style='font-size:15px;'>\n"
+
+    # ── 1. 用户输入 ──
+    thinking_html += step.next("用户输入")
+    thinking_html += f"<div style='margin-left:16px;font-size:13px;color:#666;'><code>{_esc(message)}</code></div>\n"
+
+    # ── 2. 查询改写 ──
+    original_query = message
+    rewritten_query = message
+    query_was_rewritten = False
+
+    if needs_rewrite(message):
+        thinking_html += step.next("查询改写", "⏳ 正在改写...")
+        yield thinking_html + "</div>\n</details>\n"
+
+        rewritten_query = rewrite_query(message)
+        if rewritten_query != message:
+            query_was_rewritten = True
+            thinking_html = thinking_html.replace(" ⏳ 正在改写...", "")
+            thinking_html += "<div style='margin-left:16px;font-size:13px;color:#666;'>原始查询: <code>{}</code> → 改写为: <code>{}</code></div>\n".format(
+                _esc(original_query), _esc(rewritten_query),
+            )
+        else:
+            thinking_html = thinking_html.replace(" ⏳ 正在改写...", "")
+            thinking_html += "<div style='margin-left:16px;font-size:13px;color:#666;'>改写结果与原始查询相同，无需改写</div>\n"
+    else:
+        thinking_html += step.next("查询改写")
+        thinking_html += "<div style='margin-left:16px;font-size:13px;color:#666;'>查询足够具体，无需改写</div>\n"
+
+    search_query = rewritten_query if query_was_rewritten else message
+
+    # ── 3. 多路召回 ──
+    thinking_html += step.next("多路召回", "⏳ 正在向量化...")
+    yield thinking_html + "</div>\n</details>\n"
+
+    query_vec = get_embedding(search_query)
+
+    thinking_html = thinking_html.replace(" ⏳ 正在向量化...", "")
+    thinking_html += "<div style='margin-left:16px;font-size:13px;color:#666;'>向量化模型: <code>{}</code> | 维度: {}</div>\n".format(EMBED_MODEL, len(query_vec))
+
+    keywords = parse_query_keywords(search_query)
+    thinking_html += "<div style='margin-left:16px;font-size:13px;color:#666;'>解析关键词: 检查类型=<code>{}</code> | 部位=<code>{}</code> | 诊断关键词=<code>{}</code></div>\n".format(
+        keywords.get("检查类型", "-") or "-",
+        keywords.get("部位", "-") or "-",
+        ", ".join(keywords.get("诊断关键词", [])) or "-",
+    )
+
+    # ── 路径1: 向量检索 ──
+    thinking_html += "<div style='margin-left:16px;margin-top:8px;'><b>📌 路径1: 向量检索</b>（语义相似度匹配）⏳ 正在检索...</div>\n"
+    yield thinking_html + "</div>\n</details>\n"
+
+    vec_results = vector_search(query_vec, top_k, milvus_client)
+
+    thinking_html = thinking_html.replace("⏳ 正在检索...", f"✅ 返回 {len(vec_results)} 条")
+    for i, c in enumerate(vec_results[:5], 1):
+        dist_str = f"相似度: {c.get('_distance', -1):.4f}"
+        thinking_html += (
+            "<div style='margin-left:32px;margin-bottom:1px;font-size:13px;color:#555;'>"
+            "候选{i} · {dist} · 来源: <code>{source}</code></div>\n"
+        ).format(i=i, dist=dist_str, source=_esc(c["source"]))
+
+    # ── 路径2: 元数据过滤 ──
+    thinking_html += "<div style='margin-left:16px;margin-top:8px;'><b>📌 路径2: 元数据过滤</b>（检查类型/部位/诊断精确匹配）⏳ 正在检索...</div>\n"
+    yield thinking_html + "</div>\n</details>\n"
+
+    meta_results = metadata_filter(keywords, top_k, milvus_client)
+
+    filter_desc_parts = []
+    if keywords.get("检查类型"):
+        filter_desc_parts.append(f'检查类型=="{keywords["检查类型"]}"')
+    if keywords.get("部位"):
+        filter_desc_parts.append(f'部位=="{keywords["部位"]}"')
+    if keywords.get("诊断关键词"):
+        for kw in keywords["诊断关键词"]:
+            filter_desc_parts.append(f'诊断结论 LIKE "%{kw}%"')
+    filter_desc = " AND ".join(filter_desc_parts) if filter_desc_parts else "无条件"
+
+    thinking_html = thinking_html.replace("⏳ 正在检索...", f"✅ 返回 {len(meta_results)} 条")
+    thinking_html += f"<div style='margin-left:32px;font-size:13px;color:#888;'>过滤条件: <code>{_esc(filter_desc)}</code></div>\n"
+    for i, c in enumerate(meta_results[:5], 1):
+        thinking_html += (
+            "<div style='margin-left:32px;margin-bottom:1px;font-size:13px;color:#555;'>"
+            "候选{i} · 精确匹配 · 来源: <code>{source}</code></div>\n"
+        ).format(i=i, source=_esc(c["source"]))
+
+    # ── 路径3: 关键词检索 ──
+    thinking_html += "<div style='margin-left:16px;margin-top:8px;'><b>📌 路径3: 关键词检索</b>（全文 like 匹配）⏳ 正在检索...</div>\n"
+    yield thinking_html + "</div>\n</details>\n"
+
+    kw_results = keyword_search(search_query, top_k, milvus_client)
+
+    kw_desc_parts = []
+    if keywords.get("诊断关键词"):
+        for kw in keywords["诊断关键词"]:
+            kw_desc_parts.append(f'text LIKE "%{kw}%"')
+    if keywords.get("检查类型"):
+        ct = keywords["检查类型"]
+        if ct == "MRI":
+            ct = "MR"
+        kw_desc_parts.append(f'检查类型=="{ct}"')
+    kw_desc = " AND ".join(kw_desc_parts) if kw_desc_parts else "无条件"
+
+    thinking_html = thinking_html.replace("⏳ 正在检索...", f"✅ 返回 {len(kw_results)} 条")
+    thinking_html += f"<div style='margin-left:32px;font-size:13px;color:#888;'>搜索条件: <code>{_esc(kw_desc)}</code></div>\n"
+    for i, c in enumerate(kw_results[:5], 1):
+        thinking_html += (
+            "<div style='margin-left:32px;margin-bottom:1px;font-size:13px;color:#555;'>"
+            "候选{i} · 全文匹配 · 来源: <code>{source}</code></div>\n"
+        ).format(i=i, source=_esc(c["source"]))
+
+    # ── 合并去重 ──
+    candidates = {}
+    for entity in vec_results:
+        src = entity["source"]
+        entity["_recall_paths"] = ["vector"]
+        candidates[src] = entity
+    for entity in meta_results:
+        src = entity["source"]
+        if src in candidates:
+            candidates[src]["_recall_paths"].append("metadata")
+        else:
+            entity["_recall_paths"] = ["metadata"]
+            candidates[src] = entity
+    for entity in kw_results:
+        src = entity["source"]
+        if src in candidates:
+            candidates[src]["_recall_paths"].append("keyword")
+        else:
+            entity["_recall_paths"] = ["keyword"]
+            candidates[src] = entity
+
+    total_before = len(vec_results) + len(meta_results) + len(kw_results)
+    for entity in candidates.values():
+        if len(entity["_recall_paths"]) > 1:
+            entity["_recall_path"] = "multi"
+        else:
+            entity["_recall_path"] = entity["_recall_paths"][0]
+
+    candidates_list = list(candidates.values())
+
+    thinking_html += "<div style='margin-left:16px;margin-top:8px;font-size:13px;color:#333;'><b>📊 合并去重</b>: {} 条 → {} 条（去重 {} 条）</div>\n".format(
+        total_before, len(candidates_list), total_before - len(candidates_list),
+    )
+
+    # ── 4. Rerank 重排序 ──
+    thinking_html += step.next("Rerank 重排序", "⏳ 正在精排...")
+    yield thinking_html + "</div>\n</details>\n"
+
+    documents = [e["text"] for e in candidates_list]
 
     reranked_entities = []
     try:
@@ -326,11 +498,11 @@ def rag_respond(message, history, top_k, rerank_top_k, temperature):
         for rr in rerank_results:
             idx = rr.get("index", 0)
             rerank_score = rr.get("relevance_score", 0)
-            entity = hit_entities[idx]
+            entity = candidates_list[idx]
             entity["_rerank_score"] = rerank_score
             reranked_entities.append(entity)
     except Exception as e:
-        reranked_entities = hit_entities[:rerank_top_k]
+        reranked_entities = candidates_list[:rerank_top_k]
         for entity in reranked_entities:
             entity["_rerank_score"] = -1
 
@@ -339,11 +511,13 @@ def rag_respond(message, history, top_k, rerank_top_k, temperature):
     for i, entity in enumerate(reranked_entities, 1):
         vec_score = entity.get("_distance", 0)
         rerank_score = entity.get("_rerank_score", 0)
+        recall_path = entity.get("_recall_path", "vector")
         ref_details.append({
             "index": i,
             "source": entity["source"],
             "vec_score": f"{vec_score:.4f}",
             "rerank_score": f"{rerank_score:.4f}",
+            "recall_path": recall_path,
             "检查类型": entity.get("检查类型", ""),
             "部位": entity.get("部位", ""),
             "检查项目": entity.get("检查项目", ""),
@@ -354,50 +528,40 @@ def rag_respond(message, history, top_k, rerank_top_k, temperature):
 
     context_text = "\n\n".join(contexts)
 
-    thinking_html = "<details><summary>🧠 思考过程</summary>\n"
-    thinking_html += "<div style='padding:8px;background:#f8f9fa;border-radius:6px;font-size:14px;'>\n"
-
-    thinking_html += "<p><b>🔍 第一步：向量检索</b>（top-{}）</p>\n".format(top_k)
-    for i, hit in enumerate(hits, 1):
-        entity = hit["entity"]
-        score = hit.get("distance", 0)
-        thinking_html += (
-            "<div style='margin-left:16px;margin-bottom:4px;'>"
-            "检索{i} · 相似度: {score:.4f} · 来源: <code>{source}</code></div>\n"
-        ).format(i=i, score=score, source=entity["source"])
-
-    thinking_html += "<p><b>🔄 第二步：Rerank 重排序</b>（top-{}）</p>\n".format(rerank_top_k)
-    thinking_html += "<div style='margin-left:16px;font-size:12px;color:#666;'>模型: <code>{}</code></div>\n".format(get_rerank_config()["rerank_model"])
+    thinking_html = thinking_html.replace(" ⏳ 正在精排...", "")
+    thinking_html += "<div style='margin-left:16px;font-size:13px;color:#666;'>模型: <code>{}</code> | top-{} 命中</div>\n".format(get_rerank_config()["rerank_model"], rerank_top_k)
     rerank_failed = any(ref["rerank_score"] == "-1.0000" for ref in ref_details)
     if rerank_failed:
-        thinking_html += "<div style='margin-left:16px;font-size:12px;color:#e74c3c;'>⚠️ Rerank 调用失败，已降级为向量检索结果</div>\n"
+        thinking_html += "<div style='margin-left:16px;font-size:13px;color:#e74c3c;'>⚠️ Rerank 调用失败，已降级为向量检索结果</div>\n"
     for ref in ref_details:
         thinking_html += (
             "<div style='margin-left:16px;margin-bottom:8px;'>"
-            "<b>参考{index}</b> · 向量相似度: {vec_score} · Rerank分数: {rerank_score} · 来源: <code>{source}</code><br>"
+            "<b>参考{index}</b> · 召回路径: {recall_path} · Rerank分数: {rerank_score} · 来源: <code>{source}</code><br>"
             "检查类型: {检查类型} | 部位: {部位} | 检查项目: {检查项目}<br>"
             "诊断结论: {诊断结论}<br>"
             "<details><summary>查看全文</summary><pre style='white-space:pre-wrap;'>{text}</pre></details>"
             "</div>\n"
         ).format(**ref)
 
+    # ── 5. 拼接提示词 ──
     user_message = f"参考信息：\n{context_text}\n\n用户问题：{message}"
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": user_message},
     ]
 
-    thinking_html += "<p><b>📝 第三步：构造提示词</b></p>\n"
+    thinking_html += step.next("拼接提示词")
     thinking_html += "<div style='margin-left:16px;margin-bottom:8px;'>\n"
     thinking_html += "<details><summary>System Prompt</summary><pre style='white-space:pre-wrap;'>{}</pre></details>\n".format(
-        SYSTEM_PROMPT.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        _esc(SYSTEM_PROMPT)
     )
     thinking_html += "<details><summary>User Prompt</summary><pre style='white-space:pre-wrap;'>{}</pre></details>\n".format(
-        user_message.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        _esc(user_message)
     )
     thinking_html += "</div>\n"
 
-    thinking_html += "<p><b>🤖 第四步：LLM 生成报告</b></p>\n"
+    # ── 6. 最终回复 ──
+    thinking_html += step.next("最终回复")
     thinking_html += "<div style='margin-left:16px;margin-bottom:8px;'>"
     thinking_html += "模型: <code>{}</code> | 温度: {}</div>\n".format(CHAT_MODEL, temperature)
 
@@ -405,15 +569,60 @@ def rag_respond(message, history, top_k, rerank_top_k, temperature):
 
     yield thinking_html
 
+    collapsed_thinking = thinking_html.replace("<details open>", "<details>")
+
     partial_reply = ""
     for chunk in chat_stream(messages, temperature=temperature):
         partial_reply = chunk
-        yield thinking_html + "\n" + partial_reply
+        yield collapsed_thinking + "\n" + partial_reply
 
 
 def build_ui():
     with gr.Blocks(title="医疗影像报告生成", css="""
         .chatbot .message { font-size: 16px; line-height: 1.6; }
+
+        details {
+            border: 1px solid #e0e0e0;
+            border-radius: 8px;
+            background: #fafafa;
+            margin: 8px 0;
+            overflow: hidden;
+        }
+        details[open] {
+            border-color: #4a90d9;
+            box-shadow: 0 2px 8px rgba(74,144,217,0.12);
+        }
+        details > summary {
+            padding: 10px 14px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            user-select: none;
+            list-style: none;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            transition: background 0.2s;
+        }
+        details > summary:hover {
+            background: #f0f4f8;
+        }
+        details > summary::-webkit-details-marker {
+            display: none;
+        }
+        details > summary::before {
+            content: '▶';
+            font-size: 10px;
+            color: #4a90d9;
+            transition: transform 0.25s ease;
+            flex-shrink: 0;
+        }
+        details[open] > summary::before {
+            transform: rotate(90deg);
+        }
+        details > div {
+            padding: 0 14px 10px 14px;
+        }
     """) as demo:
         gr.Markdown("# 🏥 医疗影像报告生成系统")
         gr.Markdown(
@@ -449,6 +658,11 @@ def build_ui():
                 upload_status = gr.Textbox(label="处理状态", interactive=False, lines=5)
 
         def respond(message, history, top_k_val, rerank_top_k_val, temp_val):
+            display = history + [
+                {"role": "user", "content": message},
+            ]
+            yield display, ""
+
             reply_text = ""
             for partial in rag_respond(message, history, top_k_val, rerank_top_k_val, temp_val):
                 reply_text = partial
@@ -456,7 +670,7 @@ def build_ui():
                     {"role": "user", "content": message},
                     {"role": "assistant", "content": reply_text},
                 ]
-                yield display
+                yield display, ""
 
         def clear_chat():
             return []
@@ -464,14 +678,14 @@ def build_ui():
         msg_input.submit(
             respond,
             inputs=[msg_input, chatbot, top_k, rerank_top_k, temperature],
-            outputs=[chatbot],
-        ).then(lambda: "", outputs=msg_input)
+            outputs=[chatbot, msg_input],
+        )
 
         send_btn.click(
             respond,
             inputs=[msg_input, chatbot, top_k, rerank_top_k, temperature],
-            outputs=[chatbot],
-        ).then(lambda: "", outputs=msg_input)
+            outputs=[chatbot, msg_input],
+        )
 
         clear_btn.click(clear_chat, outputs=[chatbot])
 

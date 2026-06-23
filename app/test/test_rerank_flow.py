@@ -1,4 +1,4 @@
-"""完整流程测试: 向量检索 → Rerank → Prompt拼接 → LLM输入预览"""
+"""完整流程测试: 多路召回 → Rerank → Prompt拼接 → LLM输入预览"""
 import os
 import sys
 
@@ -11,13 +11,14 @@ from pymilvus import MilvusClient
 import requests
 
 from rerank import rerank_documents, get_rerank_config
+from retrieval import multi_recall, parse_query_keywords
 
 EMBED_URL = os.environ.get("EMBED_URL", "http://14.22.83.225:11002/v1/embeddings")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "bge-m3")
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "milvus_lite.db")
 COLLECTION_NAME = "report_slices"
 
-VEC_TOP_K = 5
+TOP_K = 5
 RERANK_TOP_K = 3
 
 client = MilvusClient(uri=DB_PATH)
@@ -25,9 +26,12 @@ client.load_collection(COLLECTION_NAME)
 
 query = "CT脑出血"
 
+keywords = parse_query_keywords(query)
+
 print("=" * 60)
 print(f"用户问题: {query}")
-print(f"向量检索: top-{VEC_TOP_K}")
+print(f"解析关键词: 检查类型={keywords.get('检查类型', '-') or '-'} | 部位={keywords.get('部位', '-') or '-'} | 诊断关键词={', '.join(keywords.get('诊断关键词', [])) or '-'}")
+print(f"多路召回: 每路 top-{TOP_K}")
 print(f"Rerank: top-{RERANK_TOP_K}")
 print(f"Rerank模型: {get_rerank_config()['rerank_model']}")
 print("=" * 60)
@@ -36,31 +40,24 @@ payload = {"model": EMBED_MODEL, "input": [query]}
 resp = requests.post(EMBED_URL, json=payload, timeout=30)
 query_vec = resp.json()["data"][0]["embedding"]
 
-print(f"\n📌 第一步: 向量检索 (top-{VEC_TOP_K})")
+print(f"\n📌 第一步: 多路召回 (向量检索 + 元数据过滤 + 关键词检索)")
 print("-" * 60)
-hits = client.search(
-    collection_name=COLLECTION_NAME,
-    data=[query_vec],
-    limit=VEC_TOP_K,
-    output_fields=["source", "text", "诊断结论", "检查类型", "部位"],
-)
+candidates = multi_recall(query, query_vec, top_k=TOP_K, client=client)
 
-documents = []
-hit_entities = []
-for i, hit in enumerate(hits[0], 1):
-    e = hit["entity"]
-    documents.append(e["text"])
-    entity = {
-        "source": e["source"],
-        "text": e["text"],
-        "诊断结论": e.get("诊断结论", ""),
-        "检查类型": e.get("检查类型", ""),
-        "部位": e.get("部位", ""),
-        "_distance": round(hit["distance"], 4),
-    }
-    hit_entities.append(entity)
-    print(f"  Top-{i}: 相似度={hit['distance']:.4f} | 来源={e['source']}")
-    print(f"         诊断={e['诊断结论']} | 类型={e['检查类型']}")
+path_counts = {}
+for c in candidates:
+    path = c.get("_recall_path", "vector")
+    path_counts[path] = path_counts.get(path, 0) + 1
+
+print(f"  召回路径: {' | '.join(f'{k}: {v}条' for k, v in sorted(path_counts.items()))}")
+print(f"  合并去重后: {len(candidates)} 条候选")
+
+for i, c in enumerate(candidates[:10], 1):
+    paths_str = "+".join(c.get("_recall_paths", []))
+    dist_str = f"相似度={c.get('_distance', -1):.4f}" if c.get("_distance", -1) >= 0 else "精确匹配"
+    print(f"  候选{i} [{paths_str}] {dist_str} | 来源={c['source']} | 诊断={c.get('诊断结论', '')}")
+
+documents = [e["text"] for e in candidates]
 
 print(f"\n📌 第二步: Rerank 重排序 (top-{RERANK_TOP_K})")
 print("-" * 60)
@@ -70,15 +67,15 @@ try:
     for rr in rerank_results:
         idx = rr.get("index", 0)
         rerank_score = rr.get("relevance_score", 0)
-        entity = hit_entities[idx]
+        entity = candidates[idx]
         entity["_rerank_score"] = rerank_score
         reranked_entities.append(entity)
-        print(f"  原始位置 Top-{idx+1} → Rerank分数: {rerank_score:.4f}")
+        print(f"  原始位置 候选{idx+1} [{entity.get('_recall_path', 'vector')}] → Rerank分数: {rerank_score:.4f}")
         print(f"  来源: {entity['source']}")
-        print(f"  诊断: {entity['诊断结论']}")
+        print(f"  诊断: {entity.get('诊断结论', '')}")
 except Exception as e:
     print(f"  Rerank失败({e})，使用向量检索结果")
-    reranked_entities = hit_entities[:RERANK_TOP_K]
+    reranked_entities = candidates[:RERANK_TOP_K]
     for entity in reranked_entities:
         entity["_rerank_score"] = -1
 

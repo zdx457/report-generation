@@ -13,6 +13,8 @@ from dotenv import load_dotenv
 from pymilvus import MilvusClient
 
 from rerank import get_rerank_config, rerank_documents
+from retrieval import multi_recall, parse_query_keywords
+from query_rewrite import rewrite_query, needs_rewrite, is_too_vague, get_clarification
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env"))
 
@@ -91,36 +93,57 @@ def chat_stream(messages, max_tokens=1024, temperature=0.7):
     return full_reply
 
 
-def rag_query(question, top_k=3, rerank_top_k=1, filter_expr="", debug=False):
+def rag_query(question, top_k=5, rerank_top_k=3, debug=False):
     if rerank_top_k > top_k:
         rerank_top_k = top_k
 
+    if is_too_vague(question):
+        clarification = get_clarification(question)
+        print("\n⚠️ 您的输入过于模糊，请补充检查部位或诊断信息：")
+        print(clarification)
+        return clarification
+
+    original_query = question
+    rewritten_query = question
+    query_was_rewritten = False
+
+    if needs_rewrite(question):
+        rewritten_query = rewrite_query(question)
+        if rewritten_query != question:
+            query_was_rewritten = True
+            if debug:
+                print(f"\n✏️ 查询改写: '{original_query}' → '{rewritten_query}'")
+
+    search_query = rewritten_query if query_was_rewritten else question
+
     print("检索中...", end="", flush=True)
-    query_vec = get_embedding(question)
-    hits = search(query_vec, top_k=top_k, filter_expr=filter_expr)
+    query_vec = get_embedding(search_query)
+
+    keywords = parse_query_keywords(search_query)
+
+    client = MilvusClient(uri=DB_PATH)
+    client.load_collection(COLLECTION_NAME)
+    candidates = multi_recall(search_query, query_vec, top_k=top_k, client=client)
+    client.close()
     print(" 完成")
 
     if debug:
         print("\n" + "=" * 60)
-        print("【向量检索结果 Top-{}】".format(top_k))
+        print("【多路召回结果】（每路 top-{}）".format(top_k))
         print("=" * 60)
-        for i, hit in enumerate(hits, 1):
-            entity = hit["entity"]
-            score = hit.get("distance", "?")
-            print(f"\n--- 检索{i} (相似度: {score}) ---")
-            print(f"来源: {entity['source']}")
-            print(f"检查类型: {entity.get('检查类型', '')}")
-            print(f"部位: {entity.get('部位', '')}")
-            print(f"检查项目: {entity.get('检查项目', '')}")
-            print(f"诊断结论: {entity.get('诊断结论', '')}")
+        print(f"解析关键词: 检查类型={keywords.get('检查类型', '-') or '-'} | 部位={keywords.get('部位', '-') or '-'} | 诊断关键词={', '.join(keywords.get('诊断关键词', [])) or '-'}")
+        path_counts = {}
+        for c in candidates:
+            path = c.get("_recall_path", "vector")
+            path_counts[path] = path_counts.get(path, 0) + 1
+        print(f"召回路径: {' | '.join(f'{k}: {v}条' for k, v in sorted(path_counts.items()))}")
+        print(f"合并去重后: {len(candidates)} 条候选")
+        for i, c in enumerate(candidates[:10], 1):
+            paths_str = "+".join(c.get("_recall_paths", []))
+            dist_str = f"相似度: {c.get('_distance', -1):.4f}" if c.get("_distance", -1) >= 0 else "精确匹配"
+            print(f"  候选{i} [{paths_str}] {dist_str} | 来源: {c['source']} | 诊断: {c.get('诊断结论', '')}")
 
-    hit_entities = []
-    for hit in hits:
-        entity = hit["entity"]
-        entity["_distance"] = hit.get("distance", 0)
-        hit_entities.append(entity)
-
-    documents = [e["text"] for e in hit_entities]
+    documents = [e["text"] for e in candidates]
 
     reranked_entities = []
     try:
@@ -130,12 +153,12 @@ def rag_query(question, top_k=3, rerank_top_k=1, filter_expr="", debug=False):
         for rr in rerank_results:
             idx = rr.get("index", 0)
             rerank_score = rr.get("relevance_score", 0)
-            entity = hit_entities[idx]
+            entity = candidates[idx]
             entity["_rerank_score"] = rerank_score
             reranked_entities.append(entity)
     except Exception as e:
         print(f" Rerank失败({e})，使用向量检索结果")
-        reranked_entities = hit_entities[:rerank_top_k]
+        reranked_entities = candidates[:rerank_top_k]
 
     if debug:
         print("\n" + "=" * 60)
@@ -143,7 +166,8 @@ def rag_query(question, top_k=3, rerank_top_k=1, filter_expr="", debug=False):
         print("=" * 60)
         for i, entity in enumerate(reranked_entities, 1):
             rerank_score = entity.get("_rerank_score", "N/A")
-            print(f"\n--- 参考{i} (Rerank: {rerank_score}) ---")
+            recall_path = entity.get("_recall_path", "vector")
+            print(f"\n--- 参考{i} (Rerank: {rerank_score}, 召回路径: {recall_path}) ---")
             print(f"来源: {entity['source']}")
             print(f"诊断结论: {entity.get('诊断结论', '')}")
 
@@ -196,7 +220,7 @@ def main():
     print(f"Embedding: {EMBED_MODEL}")
     print(f"Rerank: {get_rerank_config()['rerank_model']}")
     print(f"生成模型: {CHAT_MODEL}")
-    print(f"向量检索: top-{top_k}")
+    print(f"多路召回: 向量检索 + 元数据过滤 + 关键词检索 (每路 top-{top_k})")
     print(f"Rerank返回: top-{rerank_top_k}")
     if debug:
         print("调试模式: 开启（打印检索结果和Prompt）")

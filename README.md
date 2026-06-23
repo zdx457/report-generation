@@ -20,13 +20,16 @@ cp .env.example .env
 
 `.env` 配置项：
 
-| 变量          | 说明               | 默认值                                         |
-| ------------- | ------------------ | ---------------------------------------------- |
-| `EMBED_URL`   | Embedding API 地址 | `http://14.22.83.225:11002/v1/embeddings`      |
-| `EMBED_MODEL` | 向量化模型名称     | `bge-m3`                                       |
-| `CHAT_URL`    | Chat API 地址      | `http://14.22.86.97:11001/v1/chat/completions` |
-| `CHAT_MODEL`  | 生成模型名称       | `qwen36_27b_lora`                              |
-| `HOST_PORT`   | 宿主机映射端口     | `7860`                                         |
+| 变量                  | 说明                 | 默认值                                         |
+| --------------------- | -------------------- | ---------------------------------------------- |
+| `EMBED_URL`           | Embedding API 地址   | `http://14.22.83.225:11002/v1/embeddings`      |
+| `EMBED_MODEL`         | 向量化模型名称       | `bge-m3`                                       |
+| `CHAT_URL`            | Chat API 地址        | `http://14.22.86.97:11001/v1/chat/completions` |
+| `CHAT_MODEL`          | 生成模型名称         | `qwen36_27b_lora`                              |
+| `RERANK_URL`          | Rerank API 地址      | `https://api.siliconflow.cn/v1/rerank`         |
+| `RERANK_MODEL`        | Rerank 模型名称      | `Qwen/Qwen3-VL-Reranker-8B`                    |
+| `SILICONFLOW_API_KEY` | SiliconFlow API 密钥 | （需填入）                                     |
+| `HOST_PORT`           | 宿主机映射端口       | `7860`                                         |
 
 ### 2. 一键启动
 

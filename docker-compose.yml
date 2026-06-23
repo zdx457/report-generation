@@ -7,9 +7,9 @@ services:
     ports:
       - "${HOST_PORT:-7860}:7860"
     volumes:
-      - ./rag/milvus_lite.db:/app/rag/milvus_lite.db
-      - ./rag/xlsx_slices:/app/rag/xlsx_slices
-      - ./rag/report_template:/app/rag/report_template
+      - ./app/milvus_lite.db:/app/app/milvus_lite.db
+      - ./app/xlsx_slices:/app/app/xlsx_slices
+      - ./app/report_template:/app/app/report_template
     env_file:
       - .env
     environment:

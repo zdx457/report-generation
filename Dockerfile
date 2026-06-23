@@ -11,7 +11,7 @@ RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debia
 COPY requirements.txt .
 RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ --trusted-host mirrors.aliyun.com -r requirements.txt
 
-COPY rag/ ./rag/
+COPY app/ ./app/
 
 RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
 USER appuser
@@ -21,4 +21,4 @@ EXPOSE 7860
 HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
     CMD curl -f http://localhost:7860/ || exit 1
 
-CMD ["python", "rag/web.py"]
+CMD ["python", "app/web.py"]
