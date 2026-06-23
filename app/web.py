@@ -18,15 +18,14 @@ from dotenv import load_dotenv
 from openpyxl import load_workbook
 from pymilvus import CollectionSchema, DataType, FieldSchema, MilvusClient
 
+from rerank import get_rerank_config, rerank_documents
+
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env"))
 
 EMBED_URL = os.environ.get("EMBED_URL", "http://14.22.83.225:11002/v1/embeddings")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "bge-m3")
 CHAT_URL = os.environ.get("CHAT_URL", "http://14.22.86.97:11001/v1/chat/completions")
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "qwen36_27b_lora")
-RERANK_URL = os.environ.get("RERANK_URL", "https://api.siliconflow.cn/v1/rerank")
-RERANK_MODEL = os.environ.get("RERANK_MODEL", "Qwen/Qwen3-VL-Reranker-8B")
-SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY", "")
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "milvus_lite.db")
 COLLECTION_NAME = "report_slices"
 REPORT_TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "report_template")
@@ -64,23 +63,6 @@ def search(query_vector, top_k=3):
         output_fields=["text", "source", "检查类型", "部位", "检查项目", "诊断结论"],
     )
     return results[0]
-
-
-def rerank_documents(query, documents, top_n=3):
-    headers = {"Content-Type": "application/json"}
-    if SILICONFLOW_API_KEY:
-        headers["Authorization"] = f"Bearer {SILICONFLOW_API_KEY}"
-    payload = {
-        "model": RERANK_MODEL,
-        "query": query,
-        "documents": documents,
-        "top_n": top_n,
-        "return_documents": True,
-    }
-    r = requests.post(RERANK_URL, headers=headers, json=payload, timeout=30)
-    r.raise_for_status()
-    data = r.json()
-    return data.get("results", [])
 
 
 def _xlsx_to_slices(filepath):
@@ -324,6 +306,9 @@ def chat_stream(messages, max_tokens=1024, temperature=0.7):
 
 
 def rag_respond(message, history, top_k, rerank_top_k, temperature):
+    if rerank_top_k > top_k:
+        rerank_top_k = top_k
+
     query_vec = get_embedding(message)
     hits = search(query_vec, top_k=top_k)
 
@@ -349,12 +334,11 @@ def rag_respond(message, history, top_k, rerank_top_k, temperature):
         for entity in reranked_entities:
             entity["_rerank_score"] = -1
 
-    contexts = []
     ref_details = []
+    contexts = []
     for i, entity in enumerate(reranked_entities, 1):
         vec_score = entity.get("_distance", 0)
         rerank_score = entity.get("_rerank_score", 0)
-        contexts.append(f"【参考{i}】(来源: {entity['source']})\n{entity['text']}")
         ref_details.append({
             "index": i,
             "source": entity["source"],
@@ -366,6 +350,9 @@ def rag_respond(message, history, top_k, rerank_top_k, temperature):
             "诊断结论": entity.get("诊断结论", ""),
             "text": entity["text"],
         })
+        contexts.append(f"【参考{i}】(Rerank相关性分数: {rerank_score:.4f}，来源: {entity['source']})\n{entity['text']}")
+
+    context_text = "\n\n".join(contexts)
 
     thinking_html = "<details><summary>🧠 思考过程</summary>\n"
     thinking_html += "<div style='padding:8px;background:#f8f9fa;border-radius:6px;font-size:14px;'>\n"
@@ -380,7 +367,7 @@ def rag_respond(message, history, top_k, rerank_top_k, temperature):
         ).format(i=i, score=score, source=entity["source"])
 
     thinking_html += "<p><b>🔄 第二步：Rerank 重排序</b>（top-{}）</p>\n".format(rerank_top_k)
-    thinking_html += "<div style='margin-left:16px;font-size:12px;color:#666;'>模型: <code>{}</code></div>\n".format(RERANK_MODEL)
+    thinking_html += "<div style='margin-left:16px;font-size:12px;color:#666;'>模型: <code>{}</code></div>\n".format(get_rerank_config()["rerank_model"])
     rerank_failed = any(ref["rerank_score"] == "-1.0000" for ref in ref_details)
     if rerank_failed:
         thinking_html += "<div style='margin-left:16px;font-size:12px;color:#e74c3c;'>⚠️ Rerank 调用失败，已降级为向量检索结果</div>\n"
@@ -394,7 +381,6 @@ def rag_respond(message, history, top_k, rerank_top_k, temperature):
             "</div>\n"
         ).format(**ref)
 
-    context_text = "\n\n".join(contexts)
     user_message = f"参考信息：\n{context_text}\n\n用户问题：{message}"
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -431,7 +417,7 @@ def build_ui():
     """) as demo:
         gr.Markdown("# 🏥 医疗影像报告生成系统")
         gr.Markdown(
-            f"Embedding: `{EMBED_MODEL}` | Rerank: `{RERANK_MODEL}` | 生成模型: `{CHAT_MODEL}`"
+            f"Embedding: `{EMBED_MODEL}` | Rerank: `{get_rerank_config()['rerank_model']}` | 生成模型: `{CHAT_MODEL}`"
         )
 
         with gr.Row():
@@ -449,7 +435,7 @@ def build_ui():
             with gr.Column(scale=1):
                 gr.Markdown("### 参数设置")
                 top_k = gr.Slider(1, 20, value=5, step=1, label="向量检索数量 (Top-K)")
-                rerank_top_k = gr.Slider(1, 10, value=1, step=1, label="Rerank 返回数量 (Top-K)")
+                rerank_top_k = gr.Slider(1, 20, value=3, step=1, label="Rerank 返回数量 (Top-K)", info="Rerank精排后返回给LLM的候选数量")
                 temperature = gr.Slider(0.1, 1.0, value=0.7, step=0.1, label="温度 (Temperature)")
 
                 gr.Markdown("---")
@@ -501,10 +487,6 @@ def build_ui():
 def main():
     share = "--share" in sys.argv
     debug = "--debug" in sys.argv
-    top_k_default = 3
-    for arg in sys.argv[1:]:
-        if arg.startswith("--top-k="):
-            top_k_default = int(arg.split("=")[1])
 
     demo = build_ui()
     server_name = os.environ.get("GRADIO_SERVER_NAME", "127.0.0.1")

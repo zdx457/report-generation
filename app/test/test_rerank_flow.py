@@ -1,21 +1,24 @@
-"""完整流程测试: 向量检索 → Rerank → 最终给LLM的内容"""
+"""完整流程测试: 向量检索 → Rerank → Prompt拼接 → LLM输入预览"""
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "app"))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 from dotenv import load_dotenv
+
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".env"))
 
 from pymilvus import MilvusClient
 import requests
 
+from rerank import rerank_documents, get_rerank_config
+
 EMBED_URL = os.environ.get("EMBED_URL", "http://14.22.83.225:11002/v1/embeddings")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "bge-m3")
-RERANK_URL = os.environ.get("RERANK_URL", "https://api.siliconflow.cn/v1/rerank")
-RERANK_MODEL = os.environ.get("RERANK_MODEL", "Qwen/Qwen3-VL-Reranker-8B")
-SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY", "")
-DB_PATH = os.path.join("app", "milvus_lite.db")
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "milvus_lite.db")
 COLLECTION_NAME = "report_slices"
+
+VEC_TOP_K = 5
+RERANK_TOP_K = 3
 
 client = MilvusClient(uri=DB_PATH)
 client.load_collection(COLLECTION_NAME)
@@ -24,18 +27,21 @@ query = "CT脑出血"
 
 print("=" * 60)
 print(f"用户问题: {query}")
+print(f"向量检索: top-{VEC_TOP_K}")
+print(f"Rerank: top-{RERANK_TOP_K}")
+print(f"Rerank模型: {get_rerank_config()['rerank_model']}")
 print("=" * 60)
 
 payload = {"model": EMBED_MODEL, "input": [query]}
 resp = requests.post(EMBED_URL, json=payload, timeout=30)
 query_vec = resp.json()["data"][0]["embedding"]
 
-print("\n📌 第一步: 向量检索 (top-5)")
+print(f"\n📌 第一步: 向量检索 (top-{VEC_TOP_K})")
 print("-" * 60)
 hits = client.search(
     collection_name=COLLECTION_NAME,
     data=[query_vec],
-    limit=5,
+    limit=VEC_TOP_K,
     output_fields=["source", "text", "诊断结论", "检查类型", "部位"],
 )
 
@@ -56,70 +62,52 @@ for i, hit in enumerate(hits[0], 1):
     print(f"  Top-{i}: 相似度={hit['distance']:.4f} | 来源={e['source']}")
     print(f"         诊断={e['诊断结论']} | 类型={e['检查类型']}")
 
-print(f"\n📌 第二步: Rerank 重排序 (模型: {RERANK_MODEL}, top-1)")
+print(f"\n📌 第二步: Rerank 重排序 (top-{RERANK_TOP_K})")
 print("-" * 60)
-headers = {"Content-Type": "application/json"}
-if SILICONFLOW_API_KEY:
-    headers["Authorization"] = f"Bearer {SILICONFLOW_API_KEY}"
+try:
+    rerank_results = rerank_documents(query, documents, top_n=RERANK_TOP_K)
+    reranked_entities = []
+    for rr in rerank_results:
+        idx = rr.get("index", 0)
+        rerank_score = rr.get("relevance_score", 0)
+        entity = hit_entities[idx]
+        entity["_rerank_score"] = rerank_score
+        reranked_entities.append(entity)
+        print(f"  原始位置 Top-{idx+1} → Rerank分数: {rerank_score:.4f}")
+        print(f"  来源: {entity['source']}")
+        print(f"  诊断: {entity['诊断结论']}")
+except Exception as e:
+    print(f"  Rerank失败({e})，使用向量检索结果")
+    reranked_entities = hit_entities[:RERANK_TOP_K]
+    for entity in reranked_entities:
+        entity["_rerank_score"] = -1
 
-rerank_payload = {
-    "model": RERANK_MODEL,
-    "query": query,
-    "documents": documents,
-    "top_n": 1,
-    "return_documents": True,
-}
-r = requests.post(RERANK_URL, headers=headers, json=rerank_payload, timeout=30)
-rerank_data = r.json()
-rerank_results = rerank_data.get("results", [])
-
-reranked_entities = []
-for rr in rerank_results:
-    idx = rr.get("index", 0)
-    rerank_score = rr.get("relevance_score", 0)
-    entity = hit_entities[idx]
-    entity["_rerank_score"] = rerank_score
-    reranked_entities.append(entity)
-    print(f"  原始位置 Top-{idx+1} → Rerank 第1名")
-    print(f"  Rerank分数: {rerank_score:.4f}")
-    print(f"  来源: {entity['source']}")
-    print(f"  诊断: {entity['诊断结论']}")
-
-print(f"\n📌 第三步: 最终给 LLM 的参考信息 (Prompt 拼接结果)")
+print(f"\n📌 第三步: Prompt 拼接 (带Rerank分数)")
 print("=" * 60)
-ref_parts = []
+contexts = []
 for i, ent in enumerate(reranked_entities, 1):
-    ref_text = (
-        f"【参考{i}】(来源: {ent['source']})\n"
-        f"{ent['text']}"
-    )
-    ref_parts.append(ref_text)
+    rerank_score = ent.get("_rerank_score", 0)
+    contexts.append(f"【参考{i}】(Rerank相关性分数: {rerank_score:.4f}，来源: {ent['source']})\n{ent['text']}")
 
-reference_info = "\n\n".join(ref_parts)
-print(reference_info)
+context_text = "\n\n".join(contexts)
+print(context_text)
 
 print("\n" + "=" * 60)
 print(f"📌 第四步: 完整 Prompt 预览 (发给 LLM 的内容)")
 print("=" * 60)
-system_prompt = """你是一个专业的医学影像报告生成助手。根据提供的参考信息和用户问题，生成结构化的医学影像报告。
 
-请严格按照以下格式输出：
+PROMPT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "prompt.md")
+system_prompt = "你是一个医疗影像报告生成助手。"
+if os.path.exists(PROMPT_FILE):
+    with open(PROMPT_FILE, "r", encoding="utf-8") as f:
+        system_prompt = f.read().strip()
 
-## 一、影像学表现
-（详细描述影像学所见）
+user_prompt = f"参考信息：\n{context_text}\n\n用户问题：{query}"
 
-## 二、诊断意见
-（给出明确的诊断结论）"""
+print(f"\n[System Prompt]: ({len(system_prompt)} 字符)")
+print(system_prompt[:300] + "...")
 
-user_prompt = f"""参考信息：
-{reference_info}
-
-用户问题：{query}"""
-
-print("\n[System Prompt]:")
-print(system_prompt[:200] + "...")
-
-print("\n[User Prompt]:")
+print(f"\n[User Prompt]:")
 print(user_prompt)
 
 print("\n✅ 流程结束 — 以上就是 LLM 收到的完整输入")

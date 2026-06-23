@@ -5,7 +5,7 @@ import time
 import requests
 from dotenv import load_dotenv
 
-load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".env"))
+load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "..", ".env"))
 
 EMBED_URL = "https://api.siliconflow.cn/v1"
 MODEL = "BAAI/bge-large-zh-v1.5"
