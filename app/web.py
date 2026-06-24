@@ -22,7 +22,7 @@ from rerank import get_rerank_config, rerank_documents
 from retrieval import (
     multi_recall,
 )
-from query_rewrite import rewrite_query, needs_rewrite, is_too_vague, get_clarification, standardize_query, parse_query_keywords
+from query_rewrite import rewrite_query, needs_rewrite, is_too_vague, get_clarification, standardize_query, parse_query_keywords, reload_metadata
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env"))
 
@@ -264,13 +264,19 @@ def upload_and_process(files, progress=gr.Progress()):
     milvus_client = MilvusClient(uri=DB_PATH)
     milvus_client.load_collection(COLLECTION_NAME)
 
+    progress(0.92, desc="更新元数据...")
+    from extract_metadata import extract_metadata
+    extract_metadata(REPORT_TEMPLATE_DIR)
+    reload_metadata()
+
     progress(1.0, desc="完成")
     return (
         f"处理完成！\n"
         f"- 上传文件: {len(saved_files)} 个\n"
         f"- 生成切片: {total_slices} 个\n"
         f"- 新增入库: {len(truly_new)} 条\n"
-        f"- 已有跳过: {len(new_md_files) - len(truly_new)} 条"
+        f"- 已有跳过: {len(new_md_files) - len(truly_new)} 条\n"
+        f"- 元数据已更新"
     )
 
 

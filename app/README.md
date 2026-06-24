@@ -168,11 +168,11 @@ python app/chat.py --debug                            # 调试模式（打印检
    → 对最相关参考做结构化输出（影像学表现 + 诊断意见）
 ```
 
-> 📖 完整流程详解：[Text_Embedding.md](markdown_files/Text_Embedding.md) — 数据入库6步 + 报告生成6步，含代码对应和示例
+> 📖 完整流程详解：[Text_Embedding.md](markdown_files/Text_Embedding.md) — 数据入库7步 + 报告生成7步，含代码对应和示例
 
 ## 数据入库流程
 
-上传 xlsx → 切片 → 增量检查 → 向量化 → 写入 Milvus，5步完成：
+上传 xlsx → 切片 → 增量检查 → 向量化 → 写入 Milvus → 更新元数据，7步完成：
 
 ```
 上传 xlsx 文件
@@ -191,6 +191,9 @@ python app/chat.py --debug                            # 调试模式（打印检
     │
     ▼
 ⑤ 写入 Milvus Lite（向量 + 文本 + 元数据）
+    │
+    ▼
+⑥ 更新元数据：重新提取 metadata.json + 刷新查询改写模块术语表
 ```
 
 > 📖 入库流程详解：[Text_Embedding.md](markdown_files/Text_Embedding.md#一数据入库流程上传文件)
@@ -220,7 +223,7 @@ python app/chat.py --debug                            # 调试模式（打印检
 python app/extract_metadata.py                          # 从 report_template/ 中提取标准术语
 ```
 
-> 生成 `app/report_template/metadata.json`，供术语标准化和查询改写使用。xlsx 模板更新后需重新运行。
+> 生成 `app/report_template/metadata.json`，供术语标准化和查询改写使用。Web 界面上传新 xlsx 时会自动更新 metadata.json 并刷新查询改写模块，无需手动运行。
 
 ### xlsx 切片
 

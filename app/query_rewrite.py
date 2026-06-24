@@ -59,6 +59,24 @@ KNOWN_PARTS = set(_METADATA.get("部位", [])) or {
     "四肢及关节", "血管", "颈椎", "腰椎", "胸椎",
 }
 
+_DEFAULT_KNOWN_TYPES = {"CT", "MR", "DR", "MRI", "X光", "X线"}
+_DEFAULT_KNOWN_PARTS = {
+    "头颅", "头颈部", "胸部", "腹部", "盆腔", "脊柱",
+    "四肢及关节", "血管", "颈椎", "腰椎", "胸椎",
+}
+
+
+def reload_metadata():
+    """重新加载 metadata.json 并刷新模块级术语集合。
+
+    在上传新的 xlsx 报告模板后调用，确保查询改写模块
+    能识别新入库的检查类型、部位、检查项目、诊断结论。
+    """
+    global _METADATA, KNOWN_TYPES, KNOWN_PARTS
+    _METADATA = _load_metadata()
+    KNOWN_TYPES = set(_METADATA.get("检查类型", [])) or _DEFAULT_KNOWN_TYPES
+    KNOWN_PARTS = set(_METADATA.get("部位", [])) or _DEFAULT_KNOWN_PARTS
+
 PART_ALIASES = {
     "头": "头颅",
     "脑": "头颅",
