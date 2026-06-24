@@ -6,6 +6,10 @@
 对于过于模糊的输入（如仅输入"CT"，没有部位和诊断），返回追问提示，
 引导用户补充信息。
 
+改写前会自动标准化术语（如"CT头部"→"CT头颅"），确保与数据库中的
+检查类型、部位、检查项目一致。标准术语来自 metadata.json
+（由 extract_metadata.py 从 xlsx 模板提取）。
+
 用法：
     from query_rewrite import rewrite_query, needs_rewrite, is_too_vague, get_clarification
 
@@ -28,9 +32,29 @@ import requests
 CHAT_URL = os.environ.get("CHAT_URL", "http://14.22.86.97:11001/v1/chat/completions")
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "qwen36_27b_lora")
 
-KNOWN_TYPES = {"CT", "MR", "DR", "MRI", "X光", "X线"}
+METADATA_PATH = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "report_template", "metadata.json",
+)
 
-KNOWN_PARTS = {
+
+def _load_metadata():
+    """加载 metadata.json 中的标准术语。
+
+    Returns:
+        dict: 包含 检查类型, 部位, 检查项目, 诊断结论 四个列表
+    """
+    if os.path.exists(METADATA_PATH):
+        with open(METADATA_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+_METADATA = _load_metadata()
+
+KNOWN_TYPES = set(_METADATA.get("检查类型", [])) or {"CT", "MR", "DR", "MRI", "X光", "X线"}
+
+KNOWN_PARTS = set(_METADATA.get("部位", [])) or {
     "头颅", "头颈部", "胸部", "腹部", "盆腔", "脊柱",
     "四肢及关节", "血管", "颈椎", "腰椎", "胸椎",
 }
@@ -63,11 +87,17 @@ CLARIFICATION_TEMPLATES = {
 }
 
 
-def _parse_query_components(query):
-    """解析查询中的检查类型、部位和诊断关键词。
+def parse_query_keywords(query):
+    """从用户输入中提取结构化关键词。
+
+    解析检查类型、部位，并将剩余文本作为诊断关键词。
+    供多路召回的元数据过滤和关键词检索使用。
+
+    Args:
+        query: 用户输入的查询文本（建议先经过 standardize_query 标准化）
 
     Returns:
-        dict: {检查类型: str, 部位: str, has_diag: bool}
+        dict: 包含 检查类型, 部位, 诊断关键词 等字段
     """
     check_type = ""
     for t in KNOWN_TYPES:
@@ -98,9 +128,9 @@ def _parse_query_components(query):
         cleaned = cleaned.replace(part, "")
     cleaned = cleaned.strip()
 
-    has_diag = len(cleaned) >= 2
+    diag_keywords = [cleaned] if cleaned and len(cleaned) >= 2 else []
 
-    return {"检查类型": check_type, "部位": part, "has_diag": has_diag}
+    return {"检查类型": check_type, "部位": part, "诊断关键词": diag_keywords}
 
 
 def is_too_vague(query):
@@ -116,10 +146,10 @@ def is_too_vague(query):
     Returns:
         bool: True 表示查询过于模糊，应追问用户
     """
-    components = _parse_query_components(query)
+    components = parse_query_keywords(query)
     has_type = bool(components["检查类型"])
     has_part = bool(components["部位"])
-    has_diag = components["has_diag"]
+    has_diag = bool(components["诊断关键词"])
 
     if has_type and not has_part and not has_diag:
         return True
@@ -139,7 +169,7 @@ def get_clarification(query):
     Returns:
         str: 追问提示文本，引导用户补充部位或诊断信息
     """
-    components = _parse_query_components(query)
+    components = parse_query_keywords(query)
     check_type = components["检查类型"]
 
     if check_type and check_type in CLARIFICATION_TEMPLATES:
@@ -153,21 +183,118 @@ def get_clarification(query):
 
 REWRITE_SYSTEM_PROMPT = """你是一个医疗影像报告检索系统的查询改写助手。
 
-任务：将用户简短、模糊的查询扩展为更具体、更完整的检索描述。
+任务：根据数据库元数据，将用户简短的查询扩展为更具体的检索描述。
 
 规则：
-1. 保留用户原始意图，不要改变检查类型和部位
-2. 补充该检查类型/部位常见的诊断结论关键词
-3. 补充影像学表现、影像学意见等检索相关术语
+1. 保留用户原始的检查类型和部位，使用标准术语
+2. 只补充与该检查类型/部位相关的检查项目和诊断结论关键词
+3. 只使用以下元数据中存在的术语，不要编造
 4. 输出格式：直接输出扩展后的查询文本，不要解释
-5. 扩展后长度控制在 20-40 字
-6. 不要编造用户没有提到的具体诊断
+5. 扩展后长度控制在 10-30 字
+
+数据库元数据：
+- 检查类型：{check_types}
+- 部位：{parts}
+- 检查项目：{projects}
+- 诊断结论：{diagnoses}
 
 示例：
-- 输入: "头颅" → 输出: "头颅CT MR检查 影像学表现 诊断结论"
-- 输入: "CT脑出血" → 输出: "CT脑出血 影像学表现 诊断结论 破入脑室"
-- 输入: "MR膝关节" → 输出: "MR膝关节检查 半月板 韧带 影像学表现 诊断结论"
-- 输入: "CT弥漫性肺气肿" → 输出: "CT弥漫性肺气肿 肺部影像学表现 诊断结论\""""
+- 输入: "CT头颅" → 输出: "CT头颅 颅脑平扫 颅脑平扫+增强"
+- 输入: "MR膝关节" → 输出: "MR膝关节 半月板 韧带"
+- 输入: "CT胸部" → 输出: "CT胸部 胸部平扫 胸部平扫+增强"
+- 输入: "CT脑出血" → 输出: "CT脑出血 破入脑室 颅脑平扫\""""
+
+
+def _build_rewrite_prompt(keywords=None):
+    """构建包含数据库元数据的改写提示词。
+
+    Args:
+        keywords: parse_query_keywords 返回的关键词字典，
+                  用于按检查类型+部位过滤诊断结论，减少 token 消耗。
+                  为 None 时注入全量诊断结论。
+    """
+    check_types = "、".join(_METADATA.get("检查类型", list(KNOWN_TYPES)))
+    parts = "、".join(_METADATA.get("部位", list(KNOWN_PARTS)))
+    projects = "、".join(_METADATA.get("检查项目", []))
+
+    all_diagnoses = _METADATA.get("诊断结论", [])
+    if keywords and all_diagnoses:
+        check_type = keywords.get("检查类型", "")
+        part = keywords.get("部位", "")
+        filtered = []
+        for d in all_diagnoses:
+            if check_type and check_type in d:
+                filtered.append(d)
+            elif part and part in d:
+                filtered.append(d)
+        diagnoses = "、".join(filtered) if filtered else "、".join(all_diagnoses[:200])
+    else:
+        diagnoses = "、".join(all_diagnoses[:200])
+
+    return REWRITE_SYSTEM_PROMPT.format(
+        check_types=check_types,
+        parts=parts,
+        projects=projects,
+        diagnoses=diagnoses,
+    )
+
+
+def standardize_query(query):
+    """将用户输入中的非标准术语替换为数据库标准术语。
+
+    仅替换独立的部位别名词，不会拆分已有的完整术语。
+    例如："CT头部" → "CT头颅"（"头部"是独立的部位词）
+          "CT脑出血" → "CT脑出血"（"脑出血"是完整术语，不替换"脑"）
+          "MR膝关节" → "MR膝关节"（"膝关节"是标准检查项目，不替换"关节"）
+
+    Args:
+        query: 用户输入的查询文本
+
+    Returns:
+        str: 标准化后的查询文本
+    """
+    for alias, standard in sorted(PART_ALIASES.items(), key=lambda x: -len(x[0])):
+        if alias == standard:
+            continue
+        if alias not in query:
+            continue
+        if _is_standalone_part(query, alias):
+            query = query.replace(alias, standard)
+            break
+    return query
+
+
+def _is_standalone_part(query, alias):
+    """判断别名是否作为独立的部位词出现在查询中。
+
+    判断规则：
+    1. 别名后面不能紧跟非分隔符字符（如"脑"后面跟"出血"则不是独立的）
+    2. 别名不能是某个已知检查项目或部位的子串
+
+    "头部" 在 "CT头部" 中是独立的 → True
+    "脑" 在 "CT脑出血" 中不是独立的（后面紧跟"出血"）→ False
+    "关节" 在 "MR膝关节" 中不是独立的（"膝关节"是已知检查项目）→ False
+    "头" 在 "CT头颅" 中不是独立的（后面紧跟"颅"）→ False
+
+    Args:
+        query: 完整查询文本
+        alias: 待检测的别名
+
+    Returns:
+        bool: True 表示别名是独立的部位词
+    """
+    idx = query.index(alias)
+    after = query[idx + len(alias):]
+
+    if after and after[0] not in (" ", "　", "，", "、", "。", ",", "."):
+        return False
+
+    known_terms = _METADATA.get("检查项目", []) + _METADATA.get("部位", [])
+    for term in known_terms:
+        if alias in term and term in query and alias != term:
+            return False
+
+    return True
 
 
 def needs_rewrite(query):
@@ -182,10 +309,10 @@ def needs_rewrite(query):
     if is_too_vague(query):
         return False
 
-    components = _parse_query_components(query)
+    components = parse_query_keywords(query)
     has_type = bool(components["检查类型"])
     has_part = bool(components["部位"])
-    has_diag = components["has_diag"]
+    has_diag = bool(components["诊断关键词"])
 
     if (has_type or has_part) and not has_diag:
         return True
@@ -196,6 +323,8 @@ def needs_rewrite(query):
 def rewrite_query(query, chat_url=None, chat_model=None, timeout=10):
     """使用 LLM 改写查询。
 
+    改写前会先标准化术语（如"CT头部"→"CT头颅"），确保与数据库术语一致。
+
     Args:
         query: 用户输入的查询文本
         chat_url: LLM API 地址（默认从环境变量读取）
@@ -203,16 +332,20 @@ def rewrite_query(query, chat_url=None, chat_model=None, timeout=10):
         timeout: 超时时间（秒）
 
     Returns:
-        str: 改写后的查询文本。如果改写失败，返回原始查询。
+        str: 改写后的查询文本。如果改写失败，返回标准化后的查询。
     """
+    standardized = standardize_query(query)
     url = chat_url or CHAT_URL
     model = chat_model or CHAT_MODEL
+
+    keywords = parse_query_keywords(standardized)
+    system_prompt = _build_rewrite_prompt(keywords)
 
     payload = {
         "model": model,
         "messages": [
-            {"role": "system", "content": REWRITE_SYSTEM_PROMPT},
-            {"role": "user", "content": query},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": standardized},
         ],
         "max_tokens": 128,
         "temperature": 0.3,
@@ -225,11 +358,11 @@ def rewrite_query(query, chat_url=None, chat_model=None, timeout=10):
         resp.raise_for_status()
         data = resp.json()
         rewritten = data["choices"][0]["message"]["content"].strip()
-        if rewritten and len(rewritten) >= len(query):
+        if rewritten and len(rewritten) >= len(standardized):
             return rewritten
-        return query
+        return standardized
     except Exception:
-        return query
+        return standardized
 
 
 if __name__ == "__main__":

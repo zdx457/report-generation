@@ -20,85 +20,19 @@ import os
 
 from pymilvus import MilvusClient
 
+from query_rewrite import parse_query_keywords
+
 COLLECTION_NAME = "report_slices"
 
 OUTPUT_FIELDS = ["text", "source", "检查类型", "部位", "检查项目", "诊断结论"]
 
-KNOWN_TYPES = {"CT", "MR", "DR", "MRI", "X光", "X线"}
 
-KNOWN_PARTS = {
-    "头颅", "头颈部", "胸部", "腹部", "盆腔", "脊柱",
-    "四肢及关节", "血管", "颈椎", "腰椎", "胸椎",
-}
+def _esc_filter(value):
+    """转义 Milvus 过滤表达式中的特殊字符，防止注入。
 
-PART_ALIASES = {
-    "头": "头颅",
-    "脑": "头颅",
-    "颅脑": "头颅",
-    "头部": "头颅",
-    "颈": "头颈部",
-    "颈部": "头颈部",
-    "胸": "胸部",
-    "胸部": "胸部",
-    "胸廓": "胸部",
-    "腹": "腹部",
-    "腹部": "腹部",
-    "盆腔": "盆腔",
-    "脊柱": "脊柱",
-    "脊椎": "脊柱",
-    "四肢": "四肢及关节",
-    "关节": "四肢及关节",
-    "血管": "血管",
-}
-
-
-def parse_query_keywords(query):
-    """从用户输入中提取结构化关键词。
-
-    Args:
-        query: 用户输入的查询文本
-
-    Returns:
-        dict: 包含 检查类型, 部位, 诊断关键词 等字段
+    移除双引号和反斜杠，避免破坏过滤表达式语法。
     """
-    keywords = {
-        "检查类型": "",
-        "部位": "",
-        "诊断关键词": [],
-    }
-
-    for t in KNOWN_TYPES:
-        if t in query:
-            keywords["检查类型"] = t
-            break
-
-    if "MRI" in query and not keywords["检查类型"]:
-        keywords["检查类型"] = "MR"
-
-    for alias, standard in PART_ALIASES.items():
-        if alias in query:
-            keywords["部位"] = standard
-            break
-
-    if not keywords["部位"]:
-        for part in KNOWN_PARTS:
-            if part in query:
-                keywords["部位"] = part
-                break
-
-    cleaned = query
-    for t in KNOWN_TYPES:
-        cleaned = cleaned.replace(t, "")
-    if keywords["部位"]:
-        for alias, standard in PART_ALIASES.items():
-            if standard == keywords["部位"]:
-                cleaned = cleaned.replace(alias, "")
-    cleaned = cleaned.strip()
-
-    if cleaned and len(cleaned) >= 2:
-        keywords["诊断关键词"] = [cleaned]
-
-    return keywords
+    return value.replace('"', '').replace('\\', '')
 
 
 def vector_search(query_vec, top_k, client):
@@ -145,14 +79,14 @@ def metadata_filter(keywords, top_k, client):
         check_type = keywords["检查类型"]
         if check_type == "MRI":
             check_type = "MR"
-        conditions.append(f'检查类型 == "{check_type}"')
+        conditions.append(f'检查类型 == "{_esc_filter(check_type)}"')
 
     if keywords.get("部位"):
-        conditions.append(f'部位 == "{keywords["部位"]}"')
+        conditions.append(f'部位 == "{_esc_filter(keywords["部位"])}"')
 
     if keywords.get("诊断关键词"):
         for kw in keywords["诊断关键词"]:
-            conditions.append(f'诊断结论 like "%{kw}%"')
+            conditions.append(f'诊断结论 like "%{_esc_filter(kw)}%"')
 
     if not conditions:
         return []
@@ -178,21 +112,20 @@ def metadata_filter(keywords, top_k, client):
     return candidates
 
 
-def keyword_search(query, top_k, client):
+def keyword_search(keywords, top_k, client):
     """关键词检索（基于 Milvus like 查询的全文匹配）。
 
-    对用户输入中的关键片段进行 like 匹配，
+    对诊断关键词在 text 字段中进行 like 匹配，
     适合用户输入包含专业术语的场景。
 
     Args:
-        query: 用户查询文本
+        keywords: parse_query_keywords 返回的关键词字典
         top_k: 返回数量
         client: MilvusClient 实例
 
     Returns:
         list[dict]: 候选文档列表
     """
-    keywords = parse_query_keywords(query)
     search_terms = []
 
     if keywords.get("诊断关键词"):
@@ -203,7 +136,7 @@ def keyword_search(query, top_k, client):
 
     all_conditions = []
     for term in search_terms:
-        all_conditions.append(f'text like "%{term}%"')
+        all_conditions.append(f'text like "%{_esc_filter(term)}%"')
 
     if not all_conditions:
         return []
@@ -215,10 +148,15 @@ def keyword_search(query, top_k, client):
         ct = keywords["检查类型"]
         if ct == "MRI":
             ct = "MR"
-        type_cond = f'检查类型 == "{ct}"'
+        type_cond = f'检查类型 == "{_esc_filter(ct)}"'
 
-    if type_cond:
-        filter_expr = f"({filter_expr}) and {type_cond}"
+    part_cond = ""
+    if keywords.get("部位"):
+        part_cond = f'部位 == "{_esc_filter(keywords["部位"])}"'
+
+    extra_conds = [c for c in [type_cond, part_cond] if c]
+    if extra_conds:
+        filter_expr = f"({filter_expr}) and {' and '.join(extra_conds)}"
 
     try:
         client.load_collection(COLLECTION_NAME)
@@ -239,15 +177,16 @@ def keyword_search(query, top_k, client):
     return candidates
 
 
-def multi_recall(query, query_vec, top_k, client, recall_paths=None):
+def multi_recall(query_vec, keywords, top_k, client, recall_paths=None, return_details=False):
     """多路召回 + 去重。
 
     Args:
-        query: 用户查询文本
         query_vec: 查询向量 (1024维)
+        keywords: parse_query_keywords 返回的关键词字典
         top_k: 每路召回的数量
         client: MilvusClient 实例
         recall_paths: 启用的召回路径列表，默认 ["vector", "metadata", "keyword"]
+        return_details: 是否同时返回各路原始结果（供前端展示用）
 
     Returns:
         list[dict]: 去重后的候选文档列表，每项包含:
@@ -255,16 +194,20 @@ def multi_recall(query, query_vec, top_k, client, recall_paths=None):
             - _distance: 向量检索距离（-1 表示非向量检索）
             - _recall_path: 召回路径（"vector"/"metadata"/"keyword"/"multi"）
             - _recall_paths: 所有命中该文档的召回路径列表
+
+        当 return_details=True 时，返回 (candidates, details) 元组，
+        details 为 dict，包含各路原始结果:
+            {"vector": [...], "metadata": [...], "keyword": [...]}
     """
     if recall_paths is None:
         recall_paths = ["vector", "metadata", "keyword"]
 
-    keywords = parse_query_keywords(query)
-
     candidates = {}
+    details = {}
 
     if "vector" in recall_paths:
         vec_results = vector_search(query_vec, top_k, client)
+        details["vector"] = vec_results
         for entity in vec_results:
             src = entity["source"]
             if src in candidates:
@@ -275,6 +218,7 @@ def multi_recall(query, query_vec, top_k, client, recall_paths=None):
 
     if "metadata" in recall_paths:
         meta_results = metadata_filter(keywords, top_k, client)
+        details["metadata"] = meta_results
         for entity in meta_results:
             src = entity["source"]
             if src in candidates:
@@ -284,7 +228,8 @@ def multi_recall(query, query_vec, top_k, client, recall_paths=None):
                 candidates[src] = entity
 
     if "keyword" in recall_paths:
-        kw_results = keyword_search(query, top_k, client)
+        kw_results = keyword_search(keywords, top_k, client)
+        details["keyword"] = kw_results
         for entity in kw_results:
             src = entity["source"]
             if src in candidates:
@@ -300,6 +245,8 @@ def multi_recall(query, query_vec, top_k, client, recall_paths=None):
         else:
             entity["_recall_path"] = entity["_recall_paths"][0]
 
+    if return_details:
+        return result, details
     return result
 
 
@@ -327,7 +274,7 @@ if __name__ == "__main__":
         resp = http_requests.post(EMBED_URL, json=payload, timeout=30)
         query_vec = resp.json()["data"][0]["embedding"]
 
-        candidates = multi_recall(q, query_vec, top_k=5, client=client)
+        candidates = multi_recall(query_vec, keywords, top_k=5, client=client)
 
         path_counts = {}
         for c in candidates:

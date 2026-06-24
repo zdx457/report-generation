@@ -13,8 +13,8 @@ from dotenv import load_dotenv
 from pymilvus import MilvusClient
 
 from rerank import get_rerank_config, rerank_documents
-from retrieval import multi_recall, parse_query_keywords
-from query_rewrite import rewrite_query, needs_rewrite, is_too_vague, get_clarification
+from retrieval import multi_recall
+from query_rewrite import rewrite_query, needs_rewrite, is_too_vague, get_clarification, standardize_query, parse_query_keywords
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env"))
 
@@ -104,26 +104,29 @@ def rag_query(question, top_k=5, rerank_top_k=3, debug=False):
         return clarification
 
     original_query = question
-    rewritten_query = question
+    standardized_query = standardize_query(question)
+    rewritten_query = standardized_query
     query_was_rewritten = False
 
-    if needs_rewrite(question):
-        rewritten_query = rewrite_query(question)
-        if rewritten_query != question:
+    if needs_rewrite(standardized_query):
+        rewritten_query = rewrite_query(standardized_query)
+        if rewritten_query != standardized_query:
             query_was_rewritten = True
             if debug:
-                print(f"\n✏️ 查询改写: '{original_query}' → '{rewritten_query}'")
+                if standardized_query != question:
+                    print(f"\n✏️ 术语标准化: '{original_query}' → '{standardized_query}'")
+                print(f"✏️ 查询改写: '{standardized_query}' → '{rewritten_query}'")
 
-    search_query = rewritten_query if query_was_rewritten else question
+    search_query = rewritten_query if query_was_rewritten else standardized_query
 
     print("检索中...", end="", flush=True)
     query_vec = get_embedding(search_query)
 
-    keywords = parse_query_keywords(search_query)
+    keywords = parse_query_keywords(standardized_query)
 
     client = MilvusClient(uri=DB_PATH)
     client.load_collection(COLLECTION_NAME)
-    candidates = multi_recall(search_query, query_vec, top_k=top_k, client=client)
+    candidates = multi_recall(query_vec, keywords, top_k=top_k, client=client)
     client.close()
     print(" 完成")
 

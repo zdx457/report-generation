@@ -11,7 +11,8 @@ from pymilvus import MilvusClient
 import requests
 
 from rerank import rerank_documents, get_rerank_config
-from retrieval import multi_recall, parse_query_keywords
+from retrieval import multi_recall
+from query_rewrite import parse_query_keywords
 
 EMBED_URL = os.environ.get("EMBED_URL", "http://14.22.83.225:11002/v1/embeddings")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "bge-m3")
@@ -42,7 +43,7 @@ query_vec = resp.json()["data"][0]["embedding"]
 
 print(f"\n📌 第一步: 多路召回 (向量检索 + 元数据过滤 + 关键词检索)")
 print("-" * 60)
-candidates = multi_recall(query, query_vec, top_k=TOP_K, client=client)
+candidates = multi_recall(query_vec, keywords, top_k=TOP_K, client=client)
 
 path_counts = {}
 for c in candidates:

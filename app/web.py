@@ -20,10 +20,9 @@ from pymilvus import CollectionSchema, DataType, FieldSchema, MilvusClient
 
 from rerank import get_rerank_config, rerank_documents
 from retrieval import (
-    multi_recall, parse_query_keywords,
-    vector_search, metadata_filter, keyword_search,
+    multi_recall,
 )
-from query_rewrite import rewrite_query, needs_rewrite, is_too_vague, get_clarification
+from query_rewrite import rewrite_query, needs_rewrite, is_too_vague, get_clarification, standardize_query, parse_query_keywords
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".env"))
 
@@ -350,28 +349,39 @@ def rag_respond(message, history, top_k, rerank_top_k, temperature):
 
     # ── 2. 查询改写 ──
     original_query = message
-    rewritten_query = message
+    standardized_query = standardize_query(message)
+    rewritten_query = standardized_query
     query_was_rewritten = False
 
-    if needs_rewrite(message):
+    if needs_rewrite(standardized_query):
         thinking_html += step.next("查询改写", "⏳ 正在改写...")
         yield thinking_html + "</div>\n</details>\n"
 
-        rewritten_query = rewrite_query(message)
-        if rewritten_query != message:
+        rewritten_query = rewrite_query(standardized_query)
+        if rewritten_query != standardized_query:
             query_was_rewritten = True
             thinking_html = thinking_html.replace(" ⏳ 正在改写...", "")
-            thinking_html += "<div style='margin-left:16px;font-size:13px;color:#666;'>原始查询: <code>{}</code> → 改写为: <code>{}</code></div>\n".format(
-                _esc(original_query), _esc(rewritten_query),
-            )
+            if standardized_query != message:
+                thinking_html += "<div style='margin-left:16px;font-size:13px;color:#666;'>原始查询: <code>{}</code> → 标准化: <code>{}</code> → 改写为: <code>{}</code></div>\n".format(
+                    _esc(original_query), _esc(standardized_query), _esc(rewritten_query),
+                )
+            else:
+                thinking_html += "<div style='margin-left:16px;font-size:13px;color:#666;'>原始查询: <code>{}</code> → 改写为: <code>{}</code></div>\n".format(
+                    _esc(original_query), _esc(rewritten_query),
+                )
         else:
             thinking_html = thinking_html.replace(" ⏳ 正在改写...", "")
-            thinking_html += "<div style='margin-left:16px;font-size:13px;color:#666;'>改写结果与原始查询相同，无需改写</div>\n"
+            thinking_html += "<div style='margin-left:16px;font-size:13px;color:#666;'>改写结果与标准化查询相同，无需改写</div>\n"
     else:
         thinking_html += step.next("查询改写")
-        thinking_html += "<div style='margin-left:16px;font-size:13px;color:#666;'>查询足够具体，无需改写</div>\n"
+        if standardized_query != message:
+            thinking_html += "<div style='margin-left:16px;font-size:13px;color:#666;'>原始查询: <code>{}</code> → 标准化: <code>{}</code>，无需改写</div>\n".format(
+                _esc(original_query), _esc(standardized_query),
+            )
+        else:
+            thinking_html += "<div style='margin-left:16px;font-size:13px;color:#666;'>查询足够具体，无需改写</div>\n"
 
-    search_query = rewritten_query if query_was_rewritten else message
+    search_query = rewritten_query if query_was_rewritten else standardized_query
 
     # ── 3. 多路召回 ──
     thinking_html += step.next("多路召回", "⏳ 正在向量化...")
@@ -382,7 +392,7 @@ def rag_respond(message, history, top_k, rerank_top_k, temperature):
     thinking_html = thinking_html.replace(" ⏳ 正在向量化...", "")
     thinking_html += "<div style='margin-left:16px;font-size:13px;color:#666;'>向量化模型: <code>{}</code> | 维度: {}</div>\n".format(EMBED_MODEL, len(query_vec))
 
-    keywords = parse_query_keywords(search_query)
+    keywords = parse_query_keywords(standardized_query)
     thinking_html += "<div style='margin-left:16px;font-size:13px;color:#666;'>解析关键词: 检查类型=<code>{}</code> | 部位=<code>{}</code> | 诊断关键词=<code>{}</code></div>\n".format(
         keywords.get("检查类型", "-") or "-",
         keywords.get("部位", "-") or "-",
@@ -393,8 +403,11 @@ def rag_respond(message, history, top_k, rerank_top_k, temperature):
     thinking_html += "<div style='margin-left:16px;margin-top:8px;'><b>📌 路径1: 向量检索</b>（语义相似度匹配）⏳ 正在检索...</div>\n"
     yield thinking_html + "</div>\n</details>\n"
 
-    vec_results = vector_search(query_vec, top_k, milvus_client)
+    candidates_list, recall_details = multi_recall(
+        query_vec, keywords, top_k, milvus_client, return_details=True,
+    )
 
+    vec_results = recall_details.get("vector", [])
     thinking_html = thinking_html.replace("⏳ 正在检索...", f"✅ 返回 {len(vec_results)} 条")
     for i, c in enumerate(vec_results[:5], 1):
         dist_str = f"相似度: {c.get('_distance', -1):.4f}"
@@ -407,7 +420,7 @@ def rag_respond(message, history, top_k, rerank_top_k, temperature):
     thinking_html += "<div style='margin-left:16px;margin-top:8px;'><b>📌 路径2: 元数据过滤</b>（检查类型/部位/诊断精确匹配）⏳ 正在检索...</div>\n"
     yield thinking_html + "</div>\n</details>\n"
 
-    meta_results = metadata_filter(keywords, top_k, milvus_client)
+    meta_results = recall_details.get("metadata", [])
 
     filter_desc_parts = []
     if keywords.get("检查类型"):
@@ -431,7 +444,7 @@ def rag_respond(message, history, top_k, rerank_top_k, temperature):
     thinking_html += "<div style='margin-left:16px;margin-top:8px;'><b>📌 路径3: 关键词检索</b>（全文 like 匹配）⏳ 正在检索...</div>\n"
     yield thinking_html + "</div>\n</details>\n"
 
-    kw_results = keyword_search(search_query, top_k, milvus_client)
+    kw_results = recall_details.get("keyword", [])
 
     kw_desc_parts = []
     if keywords.get("诊断关键词"):
@@ -442,6 +455,8 @@ def rag_respond(message, history, top_k, rerank_top_k, temperature):
         if ct == "MRI":
             ct = "MR"
         kw_desc_parts.append(f'检查类型=="{ct}"')
+    if keywords.get("部位"):
+        kw_desc_parts.append(f'部位=="{keywords["部位"]}"')
     kw_desc = " AND ".join(kw_desc_parts) if kw_desc_parts else "无条件"
 
     thinking_html = thinking_html.replace("⏳ 正在检索...", f"✅ 返回 {len(kw_results)} 条")
@@ -453,35 +468,7 @@ def rag_respond(message, history, top_k, rerank_top_k, temperature):
         ).format(i=i, source=_esc(c["source"]))
 
     # ── 合并去重 ──
-    candidates = {}
-    for entity in vec_results:
-        src = entity["source"]
-        entity["_recall_paths"] = ["vector"]
-        candidates[src] = entity
-    for entity in meta_results:
-        src = entity["source"]
-        if src in candidates:
-            candidates[src]["_recall_paths"].append("metadata")
-        else:
-            entity["_recall_paths"] = ["metadata"]
-            candidates[src] = entity
-    for entity in kw_results:
-        src = entity["source"]
-        if src in candidates:
-            candidates[src]["_recall_paths"].append("keyword")
-        else:
-            entity["_recall_paths"] = ["keyword"]
-            candidates[src] = entity
-
     total_before = len(vec_results) + len(meta_results) + len(kw_results)
-    for entity in candidates.values():
-        if len(entity["_recall_paths"]) > 1:
-            entity["_recall_path"] = "multi"
-        else:
-            entity["_recall_path"] = entity["_recall_paths"][0]
-
-    candidates_list = list(candidates.values())
-
     thinking_html += "<div style='margin-left:16px;margin-top:8px;font-size:13px;color:#333;'><b>📊 合并去重</b>: {} 条 → {} 条（去重 {} 条）</div>\n".format(
         total_before, len(candidates_list), total_before - len(candidates_list),
     )
