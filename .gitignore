@@ -17,3 +17,5 @@ report_template/
 venv/
 
 .docker/
+
+app/memory/data/
