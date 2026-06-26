@@ -19,15 +19,16 @@ from memory.long_term import LongTermMemory
 SESSION_ID = f"react_{uuid.uuid4().hex[:8]}"
 ENV_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), ".env")
 
+from dotenv import load_dotenv
+load_dotenv(ENV_PATH)
 
-def chat_stream(messages, max_tokens=1024, temperature=0.7, prefix=""):
+CHAT_URL = os.environ.get("CHAT_URL", "http://14.22.86.97:11001/v1/chat/completions")
+CHAT_MODEL = os.environ.get("CHAT_MODEL", "qwen36-27b")
+
+
+def chat_stream(messages, max_tokens=1024, temperature=0.7):
     """流式调用 LLM，边生成边打印，返回完整文本"""
     import requests
-    from dotenv import load_dotenv
-
-    load_dotenv(ENV_PATH)
-    CHAT_URL = os.environ.get("CHAT_URL", "http://14.22.86.97:11001/v1/chat/completions")
-    CHAT_MODEL = os.environ.get("CHAT_MODEL", "qwen36-27b")
 
     payload = {
         "model": CHAT_MODEL,
@@ -41,8 +42,6 @@ def chat_stream(messages, max_tokens=1024, temperature=0.7, prefix=""):
     r.raise_for_status()
 
     full_text = ""
-    if prefix:
-        print(prefix, end="", flush=True)
     for line in r.iter_lines(decode_unicode=True):
         if not line:
             continue
@@ -65,11 +64,6 @@ def chat_stream(messages, max_tokens=1024, temperature=0.7, prefix=""):
 
 def summarize_fn(messages: list[dict]) -> str:
     import requests
-    from dotenv import load_dotenv
-
-    load_dotenv(ENV_PATH)
-    CHAT_URL = os.environ.get("CHAT_URL", "http://14.22.86.97:11001/v1/chat/completions")
-    CHAT_MODEL = os.environ.get("CHAT_MODEL", "qwen36_27b_lora")
 
     payload = {
         "model": CHAT_MODEL,
@@ -127,10 +121,6 @@ def main():
 
     stm = ShortTermMemory(max_rounds=5, summarize_fn=summarize_fn)
     ltm = LongTermMemory(user_id=SESSION_ID)
-
-    from dotenv import load_dotenv
-    load_dotenv(ENV_PATH)
-    CHAT_MODEL = os.environ.get("CHAT_MODEL", "qwen36_27b_lora")
 
     print("=" * 60)
     print("=== ReAct 多轮推理对话（纯推理，无工具） ===")
@@ -224,8 +214,7 @@ def main():
                     print(f"  [{i}] {msg['role']}: {preview}")
 
             try:
-                output = chat_stream(messages, max_tokens=2048, temperature=0.3,
-                                     prefix=f"  💭 [第{step}步] " if not debug else "")
+                output = chat_stream(messages, max_tokens=2048, temperature=0.3)
             except Exception as e:
                 print(f"\nLLM 调用失败: {e}")
                 final_answer = f"抱歉，调用模型时出错: {e}"
@@ -246,9 +235,9 @@ def main():
             else:
                 reasoning = output
                 if "[CONTINUE]" in reasoning:
-                    idx = reasoning.find("[CONTINUE]")
-                    reasoning = reasoning[idx + len("[CONTINUE]"):]
-                reasoning = re.sub(r'\[(CONTINUE|FINAL)\]', '', reasoning).strip()
+                    reasoning = reasoning.split("[CONTINUE]", 1)[1].strip()
+                if "[FINAL]" in reasoning:
+                    reasoning = reasoning.split("[FINAL]", 1)[0].strip()
                 if not reasoning:
                     reasoning = output
 
@@ -269,8 +258,7 @@ def main():
             )
             force_messages.append({"role": "user", "content": f"以下是你的推理过程：\n\n{all_reasoning}\n\n请基于以上推理，输出最终回答。只输出 [FINAL] 和你的回答，不要输出 [CONTINUE]。\n\n[FINAL]"})
             try:
-                force_output = chat_stream(force_messages, max_tokens=2048, temperature=0.3,
-                                           prefix="\nAI: ")
+                force_output = chat_stream(force_messages, max_tokens=2048, temperature=0.3)
                 force_output = force_output.strip()
                 if "[FINAL]" in force_output:
                     idx = force_output.find("[FINAL]")

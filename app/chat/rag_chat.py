@@ -9,7 +9,9 @@ import json
 import os
 import re
 import sys
+import time
 import uuid
+from functools import wraps
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -38,6 +40,38 @@ PROMPT_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__fil
 MAX_STEPS = 5
 RAG_TOP_K = 5
 RERANK_TOP_K = 3
+MAX_CONTEXT_STEPS = 2
+
+
+def retry(max_attempts=3, delay=2, exceptions=(requests.RequestException,)):
+    def decorator(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_attempts):
+                try:
+                    return fn(*args, **kwargs)
+                except exceptions as e:
+                    if attempt == max_attempts - 1:
+                        raise
+                    print(f"  ⚠️ {e}，{delay}s 后重试 ({attempt+1}/{max_attempts})")
+                    time.sleep(delay)
+        return wrapper
+    return decorator
+
+
+def parse_react_output(text: str):
+    text = text.strip()
+    if "[FINAL]" in text:
+        return "final", text.split("[FINAL]", 1)[1].strip()
+    action_match = re.search(r'\[ACTION:\s*(\w+)\]\s*\n?(.*)', text, re.IGNORECASE | re.DOTALL)
+    if action_match:
+        action_type = action_match.group(1).strip().lower()
+        raw = action_match.group(2).strip()
+        action_input = raw.split("\n")[0].strip() if raw else ""
+        return "action", (action_type, action_input)
+    if "[CONTINUE]" in text:
+        return "continue", text.split("[CONTINUE]", 1)[1].strip()
+    return "continue", text
 
 
 def load_system_prompt():
@@ -47,6 +81,7 @@ def load_system_prompt():
     return "你是一个医疗影像报告分析助手。请根据检索到的参考信息回答用户问题。如果参考信息不足以回答问题，请如实说明。"
 
 
+@retry()
 def get_embedding(text):
     payload = {"model": EMBED_MODEL, "input": [text]}
     r = requests.post(EMBED_URL, json=payload, timeout=30)
@@ -54,7 +89,7 @@ def get_embedding(text):
     return r.json()["data"][0]["embedding"]
 
 
-def search_reports(query, top_k=RAG_TOP_K, rerank_top_k=RERANK_TOP_K):
+def search_reports(query, top_k=RAG_TOP_K, rerank_top_k=RERANK_TOP_K, client=None):
     """RAG 检索：向量检索 + 多路召回 + Rerank，返回格式化文本"""
     if rerank_top_k > top_k:
         rerank_top_k = top_k
@@ -62,10 +97,7 @@ def search_reports(query, top_k=RAG_TOP_K, rerank_top_k=RERANK_TOP_K):
     query_vec = get_embedding(query)
     keywords = parse_query_keywords(query)
 
-    client = MilvusClient(uri=DB_PATH)
-    client.load_collection(COLLECTION_NAME)
     candidates = multi_recall(query_vec, keywords, top_k=top_k, client=client)
-    client.close()
 
     if not candidates:
         return "未检索到相关报告。"
@@ -74,7 +106,7 @@ def search_reports(query, top_k=RAG_TOP_K, rerank_top_k=RERANK_TOP_K):
 
     reranked_entities = []
     try:
-        rerank_results = rerank_documents(query, documents, top_n=rerank_top_k)
+        rerank_results = rerank_with_retry(query, documents, top_n=rerank_top_k)
         for rr in rerank_results:
             idx = rr.get("index", 0)
             if idx < len(candidates):
@@ -100,8 +132,9 @@ def search_reports(query, top_k=RAG_TOP_K, rerank_top_k=RERANK_TOP_K):
     return "\n\n".join(contexts)
 
 
-def chat_stream(messages, max_tokens=2048, temperature=0.3, prefix=""):
-    """流式调用 LLM，边生成边打印，返回完整文本"""
+@retry()
+def chat_stream(messages, max_tokens=2048, temperature=0.3, debug=False):
+    """流式调用 LLM，返回完整文本。debug=True 时边生成边打印。"""
     payload = {
         "model": CHAT_MODEL,
         "messages": messages,
@@ -114,8 +147,6 @@ def chat_stream(messages, max_tokens=2048, temperature=0.3, prefix=""):
     r.raise_for_status()
 
     full_text = ""
-    if prefix:
-        print(prefix, end="", flush=True)
     for line in r.iter_lines(decode_unicode=True):
         if not line:
             continue
@@ -128,14 +159,17 @@ def chat_stream(messages, max_tokens=2048, temperature=0.3, prefix=""):
                 delta = chunk.get("choices", [{}])[0].get("delta", {})
                 content = delta.get("content", "")
                 if content:
-                    print(content, end="", flush=True)
+                    if debug:
+                        print(content, end="", flush=True)
                     full_text += content
             except json.JSONDecodeError:
                 continue
-    print()
+    if debug:
+        print()
     return full_text.strip()
 
 
+@retry()
 def summarize_fn(messages: list[dict]) -> str:
     payload = {
         "model": CHAT_MODEL,
@@ -196,6 +230,11 @@ REACT_SYSTEM_PROMPT = """你是一个具备多步推理能力的 AI 助手，你
 - 如果检索结果不足以回答问题，如实说明"""
 
 
+@retry()
+def rerank_with_retry(query, documents, top_n=3):
+    return rerank_documents(query, documents, top_n=top_n)
+
+
 def main():
     debug = "--debug" in sys.argv
 
@@ -205,6 +244,9 @@ def main():
 
     stm = ShortTermMemory(max_rounds=5, summarize_fn=summarize_fn)
     ltm = LongTermMemory(user_id=SESSION_ID)
+
+    client = MilvusClient(uri=DB_PATH)
+    client.load_collection(COLLECTION_NAME)
 
     print("=" * 60)
     print("=== ReAct 多轮推理对话（带 RAG 检索） ===")
@@ -223,195 +265,160 @@ def main():
     print("  直接输入   - 进入 ReAct 推理循环（[CONTINUE]→[ACTION]→[FINAL]）")
     print()
 
-    while True:
-        try:
-            user_input = input("你: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\n再见！")
-            ltm.on_session_end(stm, SESSION_ID)
-            ltm.close()
-            break
-
-        if not user_input:
-            continue
-
-        if user_input.lower() in ("exit", "quit"):
-            print("再见！")
-            ltm.on_session_end(stm, SESSION_ID)
-            ltm.close()
-            break
-
-        if user_input.lower() == "clear":
-            stm.clear(SESSION_ID)
-            print("🧹 会话已清空\n")
-            continue
-
-        if user_input.lower() == "info":
-            print(f"📊 记忆状态:")
-            session_info = stm.session_info(SESSION_ID)
-            print(f"   短期记忆: {session_info['current_turns']} 轮, {session_info['entity_count']} 个实体, {session_info['summary_count']} 条摘要")
-            ltm_info = ltm.get_stats()
-            print(f"   长期记忆: {ltm_info['total_sessions']} 次会话, {ltm_info['total_turns']} 轮")
-            entities = stm.get_entities(SESSION_ID)
-            if entities:
-                print(f"   当前实体: {entities}")
-            summaries = stm.get_summaries(SESSION_ID)
-            if summaries:
-                print(f"   历史摘要:")
-                for i, s in enumerate(summaries, 1):
-                    print(f"     {i}. {s}")
-            print()
-            continue
-
-        query = user_input
-        enhanced = stm.resolve_context(SESSION_ID, query)
-        if debug and enhanced != query:
-            print(f"🔗 上下文消解: '{query}' → '{enhanced}'")
-
-        base_sys_prompt = load_system_prompt()
-        sys_prompt = base_sys_prompt + "\n\n" + REACT_SYSTEM_PROMPT
-        pref_prompt = ltm.get_preference_prompt()
-        history = stm.get_history(SESSION_ID)
-
-        reasoning_steps = []
-        search_results = []
-        final_answer = None
-        step = 0
-
-        while step < MAX_STEPS:
-            step += 1
-
-            messages = [{"role": "system", "content": sys_prompt}]
-            if pref_prompt:
-                messages.append({"role": "system", "content": pref_prompt})
-            for msg in history:
-                if msg.get("content", "").strip():
-                    messages.append(msg)
-            messages.append({"role": "user", "content": f"用户问题：{query}"})
-
-            if reasoning_steps or search_results:
-                context_parts = []
-                if reasoning_steps:
-                    context_parts.append("## 你之前的推理\n\n" + "\n\n".join(
-                        f"第{i+1}步：[CONTINUE]\n{step_text}"
-                        for i, step_text in enumerate(reasoning_steps)
-                    ))
-                if search_results:
-                    context_parts.append("## 检索结果\n\n" + "\n\n---\n\n".join(
-                        f"检索{i+1}：{query_text}\n观察：\n{result_text}"
-                        for i, (query_text, result_text) in enumerate(search_results)
-                    ))
-                context_parts.append("请判断下一步：需要检索则输出 [ACTION: search]，需要推理则输出 [CONTINUE]，推理充分则输出 [FINAL]。")
-                messages.append({"role": "assistant", "content": "\n\n".join(context_parts)})
-
-            if debug:
-                print(f"\n--- 第 {step} 轮 ---")
-                for i, msg in enumerate(messages):
-                    preview = msg["content"][:120] + "..." if len(msg["content"]) > 120 else msg["content"]
-                    print(f"  [{i}] {msg['role']}: {preview}")
-
+    try:
+        while True:
             try:
-                output = chat_stream(messages, max_tokens=2048, temperature=0.3,
-                                     prefix=f"  💭 [第{step}步] " if not debug else "")
-            except Exception as e:
-                print(f"\nLLM 调用失败: {e}")
-                final_answer = f"抱歉，调用模型时出错: {e}"
-                break
-
-            if debug:
-                print(f"[完整输出]:\n{output}")
-
-            output = output.strip()
-
-            is_final = "[FINAL]" in output
-            is_action = "[ACTION: search]" in output or "[ACTION:search]" in output
-
-            if is_final:
-                idx = output.find("[FINAL]")
-                final_answer = output[idx + len("[FINAL]"):].strip()
-                if debug:
-                    print(f"✅ 推理完成（{step} 步）")
-                break
-
-            elif is_action:
-                action_match = re.search(r'\[ACTION:\s*search\]\s*(.*)', output, re.DOTALL)
-                action_text = ""
-                if action_match:
-                    action_text = action_match.group(1).strip()
-                    action_text = action_text.split("\n")[0].strip()
-                if not action_text:
-                    action_text = query
-
-                reasoning_before = ""
-                if "[CONTINUE]" in output:
-                    ci = output.find("[CONTINUE]")
-                    ai = output.find("[ACTION:")
-                    if ci < ai:
-                        reasoning_before = output[ci + len("[CONTINUE]"):ai].strip()
-                        reasoning_before = re.sub(r'\[(CONTINUE|FINAL|ACTION[^\]]*)\]', '', reasoning_before).strip()
-                        if reasoning_before:
-                            reasoning_steps.append(reasoning_before)
-
-                print(f"  🔍 检索: {action_text}")
                 try:
-                    search_result = search_reports(action_text)
-                    if debug:
-                        print(f"  📋 检索结果长度: {len(search_result)} 字符")
-                except Exception as e:
-                    search_result = f"检索失败: {e}"
-                    print(f"  ❌ {search_result}")
+                    user_input = input("你: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    print("\n再见！")
+                    break
 
-                search_results.append((action_text, search_result))
-                reasoning_steps.append(f"[检索] {action_text}\n→ 返回 {len(search_result)} 字符")
+                if not user_input:
+                    continue
 
-            else:
-                reasoning = output
-                if "[CONTINUE]" in reasoning:
-                    idx = reasoning.find("[CONTINUE]")
-                    reasoning = reasoning[idx + len("[CONTINUE]"):]
-                reasoning = re.sub(r'\[(CONTINUE|FINAL|ACTION[^\]]*)\]', '', reasoning).strip()
-                if not reasoning:
-                    reasoning = output
+                if user_input.lower() in ("exit", "quit"):
+                    print("再见！")
+                    break
 
-                reasoning_steps.append(reasoning)
+                if user_input.lower() == "clear":
+                    stm.clear(SESSION_ID)
+                    print("🧹 会话已清空\n")
+                    continue
 
-        if final_answer is None:
-            if debug:
-                print("⚠️ 达到最大步数，基于已有推理和检索结果生成最终回答")
-            force_messages = [{"role": "system", "content": sys_prompt}]
-            if pref_prompt:
-                force_messages.append({"role": "system", "content": pref_prompt})
-            for msg in history:
-                if msg.get("content", "").strip():
-                    force_messages.append(msg)
-            force_messages.append({"role": "user", "content": f"用户问题：{query}"})
-            context_parts = []
-            if reasoning_steps:
-                context_parts.append("## 推理过程\n\n" + "\n\n".join(
-                    f"第{i+1}步：{s}" for i, s in enumerate(reasoning_steps)
-                ))
-            if search_results:
-                context_parts.append("## 检索结果\n\n" + "\n\n---\n\n".join(
-                    f"检索{i+1}：{q}\n结果：\n{r}" for i, (q, r) in enumerate(search_results)
-                ))
-            context_parts.append("请基于以上推理和检索结果，输出最终回答。只输出 [FINAL] 和你的回答。\n\n[FINAL]")
-            force_messages.append({"role": "user", "content": "\n\n".join(context_parts)})
-            try:
-                force_output = chat_stream(force_messages, max_tokens=2048, temperature=0.3,
-                                           prefix="\nAI: ")
-                force_output = force_output.strip()
-                if "[FINAL]" in force_output:
-                    idx = force_output.find("[FINAL]")
-                    final_answer = force_output[idx + len("[FINAL]"):].strip()
-                else:
-                    final_answer = force_output
-            except Exception as e:
-                final_answer = f"抱歉，调用模型时出错: {e}"
-                print(f"\nAI: {final_answer}")
+                if user_input.lower() == "info":
+                    print(f"📊 记忆状态:")
+                    session_info = stm.session_info(SESSION_ID)
+                    print(f"   短期记忆: {session_info['current_turns']} 轮, {session_info['entity_count']} 个实体, {session_info['summary_count']} 条摘要")
+                    ltm_info = ltm.get_stats()
+                    print(f"   长期记忆: {ltm_info['total_sessions']} 次会话, {ltm_info['total_turns']} 轮")
+                    entities = stm.get_entities(SESSION_ID)
+                    if entities:
+                        print(f"   当前实体: {entities}")
+                    summaries = stm.get_summaries(SESSION_ID)
+                    if summaries:
+                        print(f"   历史摘要:")
+                        for i, s in enumerate(summaries, 1):
+                            print(f"     {i}. {s}")
+                    print()
+                    continue
 
-        print()
-        stm.add_turn(SESSION_ID, query, final_answer)
-        ltm.sync_from_short_term(stm, SESSION_ID)
+                query = user_input
+                enhanced = stm.resolve_context(SESSION_ID, query)
+                if debug and enhanced != query:
+                    print(f"🔗 上下文消解: '{query}' → '{enhanced}'")
+
+                base_sys_prompt = load_system_prompt()
+                sys_prompt = base_sys_prompt + "\n\n" + REACT_SYSTEM_PROMPT
+                pref_prompt = ltm.get_preference_prompt()
+                history = stm.get_history(SESSION_ID)
+
+                reasoning_steps = []
+                search_results = []
+                final_answer = None
+                step = 0
+
+                messages = [{"role": "system", "content": sys_prompt}]
+                if pref_prompt:
+                    messages.append({"role": "system", "content": pref_prompt})
+                for msg in history:
+                    if msg.get("content", "").strip():
+                        messages.append(msg)
+                messages.append({"role": "user", "content": f"用户问题：{query}"})
+
+                try:
+                    while step < MAX_STEPS:
+                        step += 1
+
+                        if debug:
+                            print(f"\n--- 第 {step} 轮 ---")
+                            for i, msg in enumerate(messages):
+                                preview = msg["content"][:120] + "..." if len(msg["content"]) > 120 else msg["content"]
+                                print(f"  [{i}] {msg['role']}: {preview}")
+
+                        try:
+                            output = chat_stream(messages, max_tokens=2048, temperature=0.3, debug=True)
+                        except Exception as e:
+                            print(f"\nLLM 调用失败: {e}")
+                            final_answer = f"抱歉，调用模型时出错: {e}"
+                            break
+
+                        if debug:
+                            print(f"[完整输出]:\n{output}")
+
+                        action_type, payload = parse_react_output(output)
+
+                        if action_type == "final":
+                            final_answer = payload
+                            if "[CONTINUE]" in output:
+                                cont_match = re.search(r'\[CONTINUE\](.*?)\[FINAL\]', output, re.DOTALL)
+                                if cont_match:
+                                    reasoning_steps.append(cont_match.group(1).strip())
+                            messages.append({"role": "assistant", "content": output})
+                            print(f"\n✅ 回答: \n{final_answer}")
+                            if debug:
+                                print(f"✅ 推理完成（{step} 步）")
+                            break
+
+                        elif action_type == "action":
+                            action_name, action_input = payload
+                            if not action_input:
+                                action_input = query
+
+                            print(f"  🔍 检索: {action_input}")
+                            messages.append({"role": "assistant", "content": output})
+                            try:
+                                search_result = search_reports(action_input, client=client)
+                                if debug:
+                                    print(f"  📋 检索结果长度: {len(search_result)} 字符")
+                                    print(f"  📋 [DEBUG] 完整检索结果:\n  {search_result}")
+                                    print("  ---")
+                            except Exception as e:
+                                search_result = f"检索失败: {e}"
+                                print(f"  ❌ {search_result}")
+
+                            search_results.append((action_input, search_result))
+                            reasoning_steps.append(f"[检索] {action_input}\n→ 返回 {len(search_result)} 字符")
+                            messages.append({"role": "user", "content": f"观察（检索结果）：{search_result}\n请判断下一步。"})
+
+                        else:
+                            reasoning_text = payload
+                            print(f"  💭 推理: {reasoning_text[:50]}{'...' if len(reasoning_text) > 50 else ''}")
+                            reasoning_steps.append(reasoning_text)
+                            messages.append({"role": "assistant", "content": reasoning_text})
+
+                    if final_answer is None:
+                        if debug:
+                            print("⚠️ 达到最大步数，基于已有推理和检索结果生成最终回答")
+                        messages.append({"role": "user", "content": "请基于以上推理和检索结果，输出最终回答。只输出 [FINAL] 和你的回答。\n\n[FINAL]"})
+                        try:
+                            force_output = chat_stream(messages, max_tokens=2048, temperature=0.3, debug=True)
+                            force_output = force_output.strip()
+                            if "[FINAL]" in force_output:
+                                idx = force_output.find("[FINAL]")
+                                final_answer = force_output[idx + len("[FINAL]"):].strip()
+                            else:
+                                final_answer = force_output
+                            print(f"\n✅ 回答: {final_answer}")
+                        except Exception as e:
+                            final_answer = f"抱歉，调用模型时出错: {e}"
+                            print(f"\nAI: {final_answer}")
+
+                finally:
+                    if final_answer:
+                        stm.add_turn(SESSION_ID, query, final_answer)
+                        ltm.sync_from_short_term(stm, SESSION_ID)
+
+                print()
+
+            except KeyboardInterrupt:
+                print("\n\n⚠️ 推理被中断")
+                break
+
+    finally:
+        ltm.on_session_end(stm, SESSION_ID)
+        ltm.close()
+        client.close()
 
 
 if __name__ == "__main__":
