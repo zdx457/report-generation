@@ -52,7 +52,7 @@ class ShortTermMemory:
         self._entities: dict[str, list[dict]] = {}
         self._counters: dict[str, int] = {}
         self._summaries: dict[str, list[str]] = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self.max_rounds = max_rounds
         self.decay_factor = decay_factor
         self._summarize_fn = summarize_fn
@@ -277,12 +277,29 @@ class ShortTermMemory:
             turns = self._sessions.get(session_id)
             counter = self._counters.get(session_id, 0)
             summaries = self._summaries.get(session_id, [])
+            records = self._entities.get(session_id, [])
+            entity_set = set()
+            for record in records:
+                for key, val in record.items():
+                    if key.startswith("_"):
+                        continue
+                    if val is None or (isinstance(val, list) and not val):
+                        continue
+                    if isinstance(val, list):
+                        for v in val:
+                            if v:
+                                entity_set.add(f"{key}:{v}")
+                    else:
+                        entity_set.add(f"{key}:{val}")
+            entity_count = len(entity_set)
             return {
                 "session_id": session_id,
+                "current_turns": len(turns) if turns else 0,
                 "turns": len(turns) if turns else 0,
                 "total_turns": counter,
                 "max_rounds": self.max_rounds,
-                "entities": self.get_entities(session_id),
+                "entity_count": entity_count,
+                "entities": dict(),
                 "summary_count": len(summaries),
             }
 
