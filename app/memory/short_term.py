@@ -31,6 +31,11 @@ FOLLOW_UP_PATTERNS = [
     "呢", "吗", "么",
 ]
 
+MODALITY_PATTERNS = [
+    "PET-CT", "PET", "SPECT", "DSA", "CTA", "MRA", "DWI", "SWI", "FLAIR",
+    "CT", "MRI", "MR", "X线", "X光", "超声", "B超",
+]
+
 DECAY_FACTOR = 0.9
 
 SUMMARIZE_PROMPT = (
@@ -173,6 +178,31 @@ class ShortTermMemory:
                     slot_best[key] = (val, weight)
         return slot_best
 
+    @staticmethod
+    def _extract_modality(query: str) -> str | None:
+        """从查询中提取检查类型（CT/MRI等），按长度降序匹配避免误匹配"""
+        query_upper = query.upper()
+        for pattern in MODALITY_PATTERNS:
+            if pattern.upper() in query_upper:
+                return pattern
+        return None
+
+    @staticmethod
+    def _missing_modality(query: str) -> bool:
+        """检查查询是否缺少检查类型"""
+        return ShortTermMemory._extract_modality(query) is None
+
+    def _extract_modality_from_history(self, session_id: str) -> str | None:
+        """从历史对话中提取最近一轮的检查类型"""
+        turns = self._sessions.get(session_id)
+        if not turns:
+            return None
+        for turn in reversed(turns.values()):
+            modality = self._extract_modality(turn["user"])
+            if modality:
+                return modality
+        return None
+
     def _has_reference(self, query: str) -> bool:
         return any(p in query for p in REFERENCE_PATTERNS)
 
@@ -185,6 +215,12 @@ class ShortTermMemory:
 
     def resolve_context(self, session_id: str, current_query: str) -> str:
         with self._lock:
+            # 优先：如果当前查询缺少检查类型，从历史继承
+            if self._missing_modality(current_query):
+                modality = self._extract_modality_from_history(session_id)
+                if modality:
+                    return f"{modality} {current_query}"
+
             slot_values = self._get_slot_values(session_id)
             if not slot_values:
                 return current_query

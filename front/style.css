@@ -1,0 +1,493 @@
+/* 全局重置 */
+*,
+*::before,
+*::after {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+:root {
+  --primary: #4096ff;
+  --primary-hover: #1677ff;
+  --bg: #f5f5f5;
+  --card-bg: #ffffff;
+  --text: #333333;
+  --text-secondary: #666666;
+  --border: #e0e0e0;
+  --radius: 8px;
+  --shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+  --user-bubble: #4096ff;
+  --ai-bubble: #f0f0f0;
+  --system-bubble: #fffbe6;
+  --recall-bg: #f6ffed;
+  --rerank-bg: #fff7e6;
+}
+
+body {
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue",
+    Arial, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  height: 100vh;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}
+
+.container {
+  width: 100%;
+  max-width: 900px;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--card-bg);
+  box-shadow: var(--shadow);
+}
+
+/* 头部 */
+.header {
+  padding: 20px 24px 16px;
+  border-bottom: 1px solid var(--border);
+  text-align: center;
+  flex-shrink: 0;
+}
+
+.header h1 {
+  font-size: 22px;
+  color: var(--primary);
+  font-weight: 700;
+}
+
+.subtitle {
+  font-size: 13px;
+  color: var(--text-secondary);
+  margin-top: 4px;
+}
+
+/* 工具栏 */
+.toolbar {
+  display: flex;
+  gap: 8px;
+  padding: 10px 24px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+/* 聊天区域 */
+.chat-container {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: var(--text-secondary);
+  gap: 8px;
+}
+
+.empty-icon {
+  font-size: 48px;
+  opacity: 0.4;
+}
+
+.empty-state p {
+  font-size: 15px;
+}
+
+.empty-state .hint {
+  font-size: 13px;
+  opacity: 0.6;
+}
+
+/* 消息气泡 */
+.message {
+  display: flex;
+  flex-direction: column;
+  max-width: 85%;
+  animation: fadeIn 0.3s ease;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.message.user {
+  align-self: flex-end;
+}
+
+.message.assistant {
+  align-self: flex-start;
+}
+
+.message.system {
+  align-self: flex-start;
+  max-width: 100%;
+}
+
+.message-role {
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+  font-weight: 600;
+}
+
+.message.user .message-role {
+  text-align: right;
+}
+
+.bubble {
+  padding: 12px 16px;
+  border-radius: var(--radius);
+  line-height: 1.6;
+  font-size: 14px;
+  word-break: break-word;
+}
+
+.message.user .bubble {
+  background: var(--user-bubble);
+  color: #ffffff;
+  border-bottom-right-radius: 2px;
+}
+
+.message.assistant .bubble {
+  background: var(--ai-bubble);
+  border-bottom-left-radius: 2px;
+}
+
+.message.system .bubble {
+  background: var(--system-bubble);
+  border: 1px solid #ffe58f;
+  font-size: 13px;
+}
+
+/* 报告内容 */
+.message.assistant .bubble h2 {
+  font-size: 16px;
+  margin: 12px 0 8px;
+  color: var(--primary);
+  border-bottom: 2px solid var(--primary);
+  padding-bottom: 4px;
+}
+
+.message.assistant .bubble h2:first-child {
+  margin-top: 0;
+}
+
+.message.assistant .bubble p {
+  margin: 6px 0;
+}
+
+/* 思考过程容器 */
+.thinking-container {
+  margin: 8px 0;
+  border: 1px solid #d9d9d9;
+  border-radius: 10px;
+  background: #fafafa;
+  transition: all 0.3s;
+}
+
+.thinking-container.thinking-done {
+  border-color: #b7eb8f;
+}
+
+.thinking-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  background: #f0f0f0;
+  cursor: pointer;
+  font-size: 14px;
+  font-weight: 600;
+  user-select: none;
+  border-bottom: 1px solid #e8e8e8;
+}
+
+.thinking-container.thinking-done .thinking-header {
+  background: #f6ffed;
+}
+
+.thinking-toggle {
+  font-size: 10px;
+  transition: transform 0.2s;
+}
+
+.thinking-collapsed .thinking-toggle {
+  transform: rotate(-90deg);
+}
+
+.thinking-collapsed .thinking-body {
+  display: none;
+}
+
+.thinking-status {
+  margin-left: auto;
+  font-size: 12px;
+  color: #fa8c16;
+  font-weight: 500;
+}
+
+.thinking-done .thinking-status {
+  color: #52c41a;
+}
+
+.thinking-body {
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* 思考步骤 */
+.thinking-step {
+  padding: 6px 0;
+  font-size: 13px;
+  line-height: 1.7;
+  border-bottom: 1px dashed #f0f0f0;
+}
+
+.thinking-step:last-child {
+  border-bottom: none;
+}
+
+.thinking-step-icon {
+  margin-right: 4px;
+}
+
+.thinking-step-label {
+  font-weight: 600;
+  color: #555;
+  margin-right: 6px;
+}
+
+.thinking-step-detail {
+  color: #333;
+}
+
+.thinking-detail-block {
+  margin: 6px 0 2px 22px;
+  padding: 8px 12px;
+  background: #fff;
+  border-radius: 6px;
+  border: 1px solid #e8e8e8;
+  font-size: 12px;
+  line-height: 1.8;
+}
+
+.thinking-highlight {
+  font-weight: 600;
+  color: #389e0d;
+  margin-top: 4px;
+}
+
+/* Rerank 列表 */
+.rerank-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.rerank-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 0;
+}
+
+.rerank-rank {
+  font-weight: 700;
+  color: #d46b08;
+  min-width: 28px;
+}
+
+.rerank-score {
+  background: #fff7e6;
+  color: #d46b08;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-weight: 600;
+  font-size: 12px;
+  min-width: 48px;
+  text-align: center;
+}
+
+.rerank-source {
+  color: #888;
+  font-size: 11px;
+  flex: 1;
+}
+
+.rerank-diagnosis {
+  color: #333;
+  font-weight: 500;
+}
+
+/* 检索结果内容 */
+.search-result-content {
+  max-height: none;
+  overflow-y: visible;
+}
+
+.search-result-content pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #555;
+}
+
+/* 推理内容 */
+.reasoning-full {
+  color: #555;
+  line-height: 1.7;
+}
+
+/* 展开/收起按钮 */
+.thinking-collapse-btn {
+  font-size: 11px;
+  color: var(--primary);
+  cursor: pointer;
+  margin-left: 8px;
+  user-select: none;
+}
+
+.thinking-collapse-btn:hover {
+  text-decoration: underline;
+}
+
+.hidden {
+  display: none;
+}
+
+/* 输入区域 */
+.input-area {
+  display: flex;
+  gap: 10px;
+  padding: 16px 24px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+  background: var(--card-bg);
+}
+
+.input-area textarea {
+  flex: 1;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  font-size: 14px;
+  font-family: inherit;
+  resize: none;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.input-area textarea:focus {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px rgba(64, 150, 255, 0.15);
+}
+
+/* 按钮 */
+.btn {
+  padding: 8px 18px;
+  border: none;
+  border-radius: var(--radius);
+  font-size: 14px;
+  cursor: pointer;
+  transition: all 0.2s;
+  font-weight: 500;
+}
+
+.btn-primary {
+  background: var(--primary);
+  color: #ffffff;
+  align-self: flex-end;
+  min-width: 80px;
+}
+
+.btn-primary:hover {
+  background: var(--primary-hover);
+}
+
+.btn-primary:disabled {
+  background: #b0d4ff;
+  cursor: not-allowed;
+}
+
+.btn-outline {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.btn-outline:hover {
+  border-color: var(--primary);
+  color: var(--primary);
+}
+
+/* 状态栏 */
+.status-bar {
+  padding: 8px 24px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--text-secondary);
+  flex-shrink: 0;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+/* 滚动条 */
+.chat-container::-webkit-scrollbar {
+  width: 6px;
+}
+
+.chat-container::-webkit-scrollbar-thumb {
+  background: #d0d0d0;
+  border-radius: 3px;
+}
+
+.chat-container::-webkit-scrollbar-thumb:hover {
+  background: #b0b0b0;
+}
+
+/* 响应式 */
+@media (max-width: 600px) {
+  .container {
+    max-width: 100%;
+  }
+  .message {
+    max-width: 95%;
+  }
+  .header {
+    padding: 14px 16px 12px;
+  }
+  .header h1 {
+    font-size: 18px;
+  }
+  .chat-container {
+    padding: 12px 16px;
+  }
+  .input-area {
+    padding: 12px 16px;
+  }
+}

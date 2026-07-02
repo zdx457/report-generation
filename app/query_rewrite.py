@@ -127,7 +127,7 @@ def parse_query_keywords(query):
 
     part = ""
     for alias, standard in PART_ALIASES.items():
-        if alias in query:
+        if alias in query and _is_standalone_part(query, alias):
             part = standard
             break
     if not part:

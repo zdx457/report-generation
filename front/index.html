@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>影像报告生成系统</title>
+    <link rel="stylesheet" href="/static/style.css" />
+  </head>
+  <body>
+    <div class="container">
+      <!-- 头部 -->
+      <header class="header">
+        <h1>影像报告生成系统</h1>
+        <p class="subtitle">基于 ReAct+RAG 的医疗影像报告结构化生成</p>
+      </header>
+
+      <!-- 会话控制栏 -->
+      <div class="toolbar">
+        <button id="btnClear" class="btn btn-outline">清空会话</button>
+        <button id="btnInfo" class="btn btn-outline">会话状态</button>
+      </div>
+
+      <!-- 聊天区域 -->
+      <div class="chat-container" id="chatContainer">
+        <div class="empty-state">
+          <div class="empty-icon">📋</div>
+          <p>输入CT/MRI等检查关键词，生成结构化影像报告</p>
+          <p class="hint">例如：CT脑出血、MRI膝关节、脑梗</p>
+        </div>
+      </div>
+
+      <!-- 输入区域 -->
+      <div class="input-area">
+        <textarea
+          id="userInput"
+          placeholder="输入检查关键词，如：CT脑出血、脑梗..."
+          rows="2"
+          autofocus
+        ></textarea>
+        <button id="btnSend" class="btn btn-primary">
+          <span class="btn-text">发送</span>
+          <span class="btn-loading" style="display: none">⏳ 生成中...</span>
+        </button>
+      </div>
+
+      <!-- 状态栏 -->
+      <div class="status-bar" id="statusBar">
+        <span id="statusText">就绪</span>
+      </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
