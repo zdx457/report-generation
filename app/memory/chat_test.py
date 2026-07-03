@@ -12,6 +12,9 @@ import os
 import sys
 import uuid
 
+import requests
+from dotenv import load_dotenv
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from memory.short_term import ShortTermMemory
@@ -22,8 +25,6 @@ ENV_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.
 
 
 def chat_stream(messages, max_tokens=1024, temperature=0.7):
-    import requests
-    from dotenv import load_dotenv
 
     load_dotenv(ENV_PATH)
     CHAT_URL = os.environ.get("CHAT_URL", "http://14.22.86.97:11001/v1/chat/completions")
@@ -66,8 +67,6 @@ def chat_stream(messages, max_tokens=1024, temperature=0.7):
 
 
 def summarize_fn(messages: list[dict]) -> str:
-    import requests
-    from dotenv import load_dotenv
 
     load_dotenv(ENV_PATH)
     CHAT_URL = os.environ.get("CHAT_URL", "http://14.22.86.97:11001/v1/chat/completions")
@@ -95,7 +94,6 @@ def main():
     stm = ShortTermMemory(max_rounds=5, summarize_fn=summarize_fn)
     ltm = LongTermMemory(user_id=SESSION_ID)
 
-    from dotenv import load_dotenv
     load_dotenv(ENV_PATH)
     CHAT_MODEL = os.environ.get("CHAT_MODEL", "qwen36_27b_lora")
 
@@ -104,7 +102,7 @@ def main():
     print("=== 多轮对话（带记忆）已启动 ===")
     print(f"模型: {CHAT_MODEL}")
     print(f"短期记忆: 最近 {stm.max_rounds} 轮")
-    print(f"长期记忆: {ltm.file_path}")
+    print(f"长期记忆: {ltm.db_path}")
     print(f"用户ID: {ltm.user_id}")
     if debug:
         print("调试模式: 开启（显示上下文消解和记忆状态）")

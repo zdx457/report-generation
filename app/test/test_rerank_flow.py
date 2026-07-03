@@ -10,13 +10,13 @@ load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..",
 from pymilvus import MilvusClient
 import requests
 
-from rerank import rerank_documents, get_rerank_config
-from retrieval import multi_recall
-from query_rewrite import parse_query_keywords
+from rag.rerank import rerank_documents, get_rerank_config
+from rag.retrieval import multi_recall
+from rag.query_rewrite import parse_query_keywords
 
 EMBED_URL = os.environ.get("EMBED_URL", "http://14.22.83.225:11002/v1/embeddings")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "bge-m3")
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "milvus_lite.db")
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data_pipeline", "milvus_lite.db")
 COLLECTION_NAME = "report_slices"
 
 TOP_K = 5
@@ -94,7 +94,7 @@ print("\n" + "=" * 60)
 print(f"📌 第四步: 完整 Prompt 预览 (发给 LLM 的内容)")
 print("=" * 60)
 
-PROMPT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "prompt.md")
+PROMPT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "rag", "prompt.md")
 system_prompt = "你是一个医疗影像报告生成助手。"
 if os.path.exists(PROMPT_FILE):
     with open(PROMPT_FILE, "r", encoding="utf-8") as f:

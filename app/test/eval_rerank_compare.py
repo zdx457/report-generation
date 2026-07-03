@@ -19,13 +19,13 @@ from dotenv import load_dotenv
 from pymilvus import MilvusClient
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from rerank import rerank_documents
+from rag.rerank import rerank_documents
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".env"))
 
 EMBED_URL = os.environ.get("EMBED_URL", "http://14.22.83.225:11002/v1/embeddings")
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "bge-m3")
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "milvus_lite.db")
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data_pipeline", "milvus_lite.db")
 COLLECTION_NAME = "report_slices"
 
 

@@ -34,7 +34,7 @@ CHAT_MODEL = os.environ.get("CHAT_MODEL", "qwen36_27b_lora")
 
 METADATA_PATH = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
-    "report_template", "metadata.json",
+    "..", "data_pipeline", "report_template", "metadata.json",
 )
 
 

@@ -26,9 +26,9 @@ from pymilvus import MilvusClient
 
 from memory.short_term import ShortTermMemory
 from memory.long_term import LongTermMemory
-from rerank import get_rerank_config, rerank_documents
-from retrieval import multi_recall
-from query_rewrite import (
+from rag.rerank import rerank_documents, get_rerank_config
+from rag.retrieval import multi_recall
+from rag.query_rewrite import (
     parse_query_keywords,
     is_too_vague,
     get_clarification,
@@ -58,9 +58,9 @@ EMBED_URL = os.environ.get("EMBED_URL", "http://14.22.83.225:11002/v1/embeddings
 EMBED_MODEL = os.environ.get("EMBED_MODEL", "bge-m3")
 CHAT_URL = os.environ.get("CHAT_URL", "http://14.22.86.97:11001/v1/chat/completions")
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "qwen36-27b")
-DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "milvus_lite.db")
+DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data_pipeline", "milvus_lite.db")
 COLLECTION_NAME = "report_slices"
-PROMPT_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "prompt.md")
+PROMPT_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "rag", "prompt.md")
 
 MAX_STEPS = 5
 RAG_TOP_K = 5

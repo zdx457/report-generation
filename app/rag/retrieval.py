@@ -20,7 +20,10 @@ import os
 
 from pymilvus import MilvusClient
 
-from query_rewrite import parse_query_keywords
+try:
+    from .query_rewrite import parse_query_keywords
+except ImportError:
+    from query_rewrite import parse_query_keywords
 
 COLLECTION_NAME = "report_slices"
 
@@ -253,7 +256,7 @@ def multi_recall(query_vec, keywords, top_k, client, recall_paths=None, return_d
 if __name__ == "__main__":
     import requests as http_requests
 
-    DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "milvus_lite.db")
+    DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data_pipeline", "milvus_lite.db")
     EMBED_URL = os.environ.get("EMBED_URL", "http://14.22.83.225:11002/v1/embeddings")
     EMBED_MODEL = os.environ.get("EMBED_MODEL", "bge-m3")
 

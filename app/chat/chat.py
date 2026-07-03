@@ -11,6 +11,8 @@ import re
 import sys
 import uuid
 
+import requests
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from memory.short_term import ShortTermMemory
@@ -28,7 +30,6 @@ CHAT_MODEL = os.environ.get("CHAT_MODEL", "qwen36-27b")
 
 def chat_stream(messages, max_tokens=1024, temperature=0.7):
     """流式调用 LLM，边生成边打印，返回完整文本"""
-    import requests
 
     payload = {
         "model": CHAT_MODEL,
@@ -63,7 +64,6 @@ def chat_stream(messages, max_tokens=1024, temperature=0.7):
 
 
 def summarize_fn(messages: list[dict]) -> str:
-    import requests
 
     payload = {
         "model": CHAT_MODEL,
