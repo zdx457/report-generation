@@ -11,6 +11,7 @@ import re
 import sys
 import time
 import uuid
+import shutil
 import asyncio
 import queue
 from functools import wraps
@@ -40,9 +41,13 @@ from config import (
     get_rag_top_k, get_rerank_top_k,
 )
 
+from data_pipeline.build_vector_db import build_db
+from data_pipeline.extract_metadata import extract_metadata
+from data_pipeline.xlsx_slicer import process_file
+
 # ── Web 模式依赖（可选） ──
 try:
-    from fastapi import FastAPI, Request
+    from fastapi import FastAPI, Request, UploadFile, File
     from fastapi.responses import StreamingResponse, FileResponse
     from fastapi.staticfiles import StaticFiles
     import uvicorn
@@ -746,6 +751,148 @@ def web_main(port=8000):
             "total_turns": info.get("total_turns", 0),
             "max_rounds": info.get("max_rounds", 5),
         }
+
+    @app.get("/api/kb/status")
+    async def kb_status():
+        total = 0
+        try:
+            if os.path.exists(DB_PATH):
+                client = MilvusClient(DB_PATH)
+                total = len(client.query(COLLECTION_NAME, filter="", output_fields=["count(*)"]))
+                client.close()
+        except Exception:
+            pass
+        slices_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "app", "data_pipeline", "xlsx_slices")
+        md_count = len([f for f in os.listdir(slices_dir) if f.endswith(".md")]) if os.path.isdir(slices_dir) else 0
+        metadata_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data_pipeline", "report_template", "metadata.json")
+        meta_exists = os.path.exists(metadata_path)
+        return {"total": total, "md_count": md_count, "db_path": DB_PATH, "metadata_exists": meta_exists}
+
+    @app.get("/api/kb/files")
+    async def kb_files():
+        report_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data_pipeline", "report_template")
+        slices_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data_pipeline", "xlsx_slices")
+        files = []
+        if os.path.isdir(report_dir):
+            for fname in sorted(os.listdir(report_dir)):
+                if fname.endswith(".xlsx") and not fname.startswith("~$"):
+                    fpath = os.path.join(report_dir, fname)
+                    stat = os.stat(fpath)
+                    basename = os.path.splitext(fname)[0]
+                    slice_count = 0
+                    if os.path.isdir(slices_dir):
+                        slice_count = len([f for f in os.listdir(slices_dir) if f.startswith(basename) and f.endswith(".md")])
+                    files.append({
+                        "name": fname,
+                        "slice_count": slice_count,
+                        "size": stat.st_size,
+                        "mtime": stat.st_mtime,
+                    })
+        return {"files": files}
+
+    @app.post("/api/kb/build")
+    async def kb_build(request: Request):
+        body = await request.json()
+        rebuild = body.get("rebuild", False)
+        batch_size = body.get("batch_size", 16)
+        slices_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "app", "data_pipeline", "xlsx_slices")
+
+        async def event_stream():
+            loop = asyncio.get_event_loop()
+            event_queue = queue.Queue()
+
+            def _emit_log(data):
+                event_queue.put_nowait(json.dumps(data, ensure_ascii=False))
+
+            def run():
+                build_db(slices_dir, batch_size=batch_size, rebuild=rebuild, progress_callback=_emit_log)
+                event_queue.put_nowait("[DONE]")
+
+            loop.run_in_executor(None, run)
+
+            while True:
+                try:
+                    event = await loop.run_in_executor(None, event_queue.get, True, 600)
+                    if event == "[DONE]":
+                        yield "data: [DONE]\n\n"
+                        break
+                    yield f"data: {event}\n\n"
+                except queue.Empty:
+                    break
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+    @app.post("/api/kb/extract-metadata")
+    async def kb_extract_metadata():
+        metadata_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data_pipeline", "report_template")
+        metadata_path = os.path.join(metadata_dir, "metadata.json")
+
+        async def event_stream():
+            loop = asyncio.get_event_loop()
+            event_queue = queue.Queue()
+
+            def _emit_log(data):
+                event_queue.put_nowait(json.dumps(data, ensure_ascii=False))
+
+            def run():
+                extract_metadata(metadata_dir, metadata_path, progress_callback=_emit_log)
+                event_queue.put_nowait("[DONE]")
+
+            loop.run_in_executor(None, run)
+
+            while True:
+                try:
+                    event = await loop.run_in_executor(None, event_queue.get, True, 120)
+                    if event == "[DONE]":
+                        yield "data: [DONE]\n\n"
+                        break
+                    yield f"data: {event}\n\n"
+                except queue.Empty:
+                    break
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+    @app.post("/api/kb/upload")
+    async def kb_upload(file: UploadFile = File(...)):
+        if not file.filename.endswith(".xlsx"):
+            return {"error": "只支持 .xlsx 文件"}
+
+        report_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data_pipeline", "report_template")
+        slices_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data_pipeline", "xlsx_slices")
+        os.makedirs(report_dir, exist_ok=True)
+        os.makedirs(slices_dir, exist_ok=True)
+
+        filepath = os.path.join(report_dir, file.filename)
+
+        async def event_stream():
+            loop = asyncio.get_event_loop()
+            event_queue = queue.Queue()
+
+            def _emit_log(data):
+                event_queue.put_nowait(json.dumps(data, ensure_ascii=False))
+
+            def run():
+                _emit_log({"level": "info", "msg": f"上传文件: {file.filename}"})
+                with open(filepath, "wb") as f:
+                    shutil.copyfileobj(file.file, f)
+                _emit_log({"level": "info", "msg": "切片中..."})
+                count = process_file(filepath, slices_dir, progress_callback=_emit_log)
+                _emit_log({"level": "done", "msg": f"✅ 切片完成，共生成 {count} 个 md 文件"})
+                event_queue.put_nowait("[DONE]")
+
+            loop.run_in_executor(None, run)
+
+            while True:
+                try:
+                    event = await loop.run_in_executor(None, event_queue.get, True, 120)
+                    if event == "[DONE]":
+                        yield "data: [DONE]\n\n"
+                        break
+                    yield f"data: {event}\n\n"
+                except queue.Empty:
+                    break
+
+        return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     @app.delete("/api/session")
     async def clear_session(session_id: str = "default"):

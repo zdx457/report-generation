@@ -18,11 +18,16 @@ from pymilvus import CollectionSchema, DataType, FieldSchema, MilvusClient
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".env"))
 
-EMBED_URL = os.environ.get("EMBED_URL", "http://14.22.83.225:11002/v1/embeddings")
-EMBED_MODEL = os.environ.get("EMBED_MODEL", "bge-m3")
-EMBED_DIM = 1024
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "milvus_lite.db")
-COLLECTION_NAME = "report_slices"
+from config import (
+    get_embed_base_url, get_embed_model,
+    get_embed_dimension, get_db_path, get_collection_name,
+)
+
+EMBED_URL = get_embed_base_url()
+EMBED_MODEL = get_embed_model()
+EMBED_DIM = get_embed_dimension()
+DB_PATH = get_db_path()
+COLLECTION_NAME = get_collection_name()
 
 
 def parse_md_slice(filepath):
@@ -63,8 +68,13 @@ def parse_md_slice(filepath):
     return natural_text, metadata
 
 
-def get_embeddings(texts, batch_size=16):
+def get_embeddings(texts, batch_size=16, progress_callback=None):
     """调用 bge-m3 接口，批量获取向量，带重试。"""
+    def _log(msg, level="info"):
+        print(msg, flush=True)
+        if progress_callback:
+            progress_callback({"level": level, "msg": msg})
+
     all_embeddings = []
     total = len(texts)
     for i in range(0, total, batch_size):
@@ -84,15 +94,14 @@ def get_embeddings(texts, batch_size=16):
             except Exception as e:
                 if attempt < 4:
                     wait = (attempt + 1) * 5
-                    print(f"  批次 {i//batch_size+1} 失败({e})，{wait}s 后重试...")
+                    _log(f"批次 {i//batch_size+1} 失败({e})，{wait}s 后重试...", "error")
                     time.sleep(wait)
                 else:
-                    print(f"  批次 {i//batch_size+1} 重试5次仍失败，跳过", file=sys.stderr)
+                    _log(f"批次 {i//batch_size+1} 重试5次仍失败，跳过", "error")
                     all_embeddings.extend([None] * len(batch))
         done = min(i + batch_size, total)
-        print(f"\r  向量化进度: {done}/{total} ({done*100//total}%)", end="", flush=True)
+        _log(f"向量化进度: {done}/{total} ({done*100//total}%)")
         time.sleep(0.2)
-    print()
     all_embeddings = [e for e in all_embeddings if e is not None]
     return all_embeddings
 
@@ -155,18 +164,23 @@ def insert_data(client, texts, metadatas, source_files, embeddings):
     return len(data)
 
 
-def build_db(input_dir, batch_size=16, rebuild=False):
+def build_db(input_dir, batch_size=16, rebuild=False, progress_callback=None):
+    def _log(msg, level="info"):
+        print(msg, flush=True)
+        if progress_callback:
+            progress_callback({"level": level, "msg": msg})
+
     if not os.path.isdir(input_dir):
-        print(f"输入文件夹不存在: {input_dir}", file=sys.stderr)
+        _log(f"输入文件夹不存在: {input_dir}", "error")
         return
 
     md_files = sorted([f for f in os.listdir(input_dir) if f.endswith(".md")])
     if not md_files:
-        print(f"在 {input_dir} 中未找到 md 文件", file=sys.stderr)
+        _log(f"在 {input_dir} 中未找到 md 文件", "error")
         return
 
     if rebuild:
-        print("全量重建模式：删除旧数据...")
+        _log("全量重建模式：删除旧数据...")
         if os.path.exists(DB_PATH):
             shutil.rmtree(DB_PATH)
 
@@ -175,19 +189,19 @@ def build_db(input_dir, batch_size=16, rebuild=False):
     if rebuild:
         create_collection(client)
         new_files = md_files
-        print(f"将处理全部 {len(new_files)} 个切片文件")
+        _log(f"将处理全部 {len(new_files)} 个切片文件")
     else:
         create_collection(client)
         existing = get_existing_sources(client)
         new_files = [f for f in md_files if f not in existing]
-        print(f"数据库已有: {len(existing)} 条")
-        print(f"新增切片: {len(new_files)} 个")
+        _log(f"数据库已有: {len(existing)} 条")
+        _log(f"新增切片: {len(new_files)} 个")
         if not new_files:
-            print("没有新切片需要添加")
+            _log("没有新切片需要添加")
             client.close()
             return
 
-    print(f"开始解析 {len(new_files)} 个新切片...")
+    _log(f"开始解析 {len(new_files)} 个新切片...")
 
     texts = []
     metadatas = []
@@ -200,31 +214,32 @@ def build_db(input_dir, batch_size=16, rebuild=False):
             metadatas.append(meta or {})
             source_files.append(fname)
 
-    print(f"有效新切片: {len(texts)} 条")
+    _log(f"有效新切片: {len(texts)} 条")
     if not texts:
-        print("没有有效切片可添加")
+        _log("没有有效切片可添加")
         client.close()
         return
 
-    print(f"开始向量化 (batch_size={batch_size})...")
-    embeddings = get_embeddings(texts, batch_size=batch_size)
+    _log(f"开始向量化 (batch_size={batch_size})...")
+    embeddings = get_embeddings(texts, batch_size=batch_size, progress_callback=progress_callback)
 
     if not embeddings:
-        print("向量化失败，未获取到任何向量", file=sys.stderr)
+        _log("向量化失败，未获取到任何向量", "error")
         client.close()
         return
 
-    print(f"向量化完成，维度: {len(embeddings[0])}")
-    print("写入 Milvus Lite...")
+    _log(f"向量化完成，维度: {len(embeddings[0])}")
+    _log("写入 Milvus Lite...")
 
     inserted = insert_data(client, texts, metadatas, source_files, embeddings)
 
     total = client.query(COLLECTION_NAME, filter="", output_fields=["count(*)"])
     total_count = len(total)
-    print(f"本次新增: {inserted} 条")
-    print(f"数据库总计: {total_count} 条")
-    print(f"数据库文件: {DB_PATH}")
+    _log(f"本次新增: {inserted} 条")
+    _log(f"数据库总计: {total_count} 条")
+    _log(f"数据库文件: {DB_PATH}")
     client.close()
+    _log("__DONE__", "done")
 
 
 def main():

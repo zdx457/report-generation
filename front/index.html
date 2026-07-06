@@ -3,63 +3,121 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>影像报告生成系统</title>
-    <link rel="stylesheet" href="/static/style.css?v=5" />
+    <title>影像报告生成Agent</title>
+    <link rel="stylesheet" href="/static/style.css?v=8" />
   </head>
   <body>
-    <div class="container">
-      <!-- 头部 -->
-      <header class="header">
-        <h1>影像报告生成系统</h1>
-        <p class="subtitle">基于 ReAct+RAG 的医疗影像报告结构化生成</p>
-      </header>
-
-      <!-- 会话控制栏 -->
-      <div class="toolbar">
-        <button id="btnClear" class="btn btn-outline">清空会话</button>
-        <button id="btnMemory" class="btn btn-outline">短期记忆</button>
-      </div>
-
-      <!-- 短期记忆面板 -->
-      <div class="memory-panel" id="memoryPanel" style="display: none;">
-        <div class="memory-panel-header">
-          <h3>短期记忆详情</h3>
-          <button class="memory-panel-close" id="btnMemoryClose">✕</button>
+    <div class="app">
+      <!-- 左侧导航 -->
+      <nav class="sidebar" id="sidebar">
+        <div class="sidebar-brand">🏥</div>
+        <div class="sidebar-nav">
+          <button class="sidebar-btn active" data-page="agent" title="Agent 对话">
+            <span class="sidebar-icon">💬</span>
+            <span class="sidebar-label">Agent</span>
+          </button>
+          <button class="sidebar-btn" data-page="kb" title="知识库管理">
+            <span class="sidebar-icon">📚</span>
+            <span class="sidebar-label">知识库</span>
+          </button>
         </div>
-        <div class="memory-panel-body" id="memoryPanelBody">
-          <div class="memory-loading">加载中...</div>
+      </nav>
+
+      <!-- 右侧主区域 -->
+      <div class="main">
+        <!-- Agent 页面 -->
+        <div class="page active" id="pageAgent">
+          <header class="header">
+            <h1>影像报告生成系统</h1>
+          </header>
+
+          <div class="toolbar">
+            <button id="btnClear" class="btn btn-outline">清空会话</button>
+            <button id="btnMemory" class="btn btn-outline">短期记忆</button>
+          </div>
+
+          <div class="memory-panel" id="memoryPanel" style="display: none">
+            <div class="memory-panel-header">
+              <h3>短期记忆详情</h3>
+              <button class="memory-panel-close" id="btnMemoryClose">✕</button>
+            </div>
+            <div class="memory-panel-body" id="memoryPanelBody">
+              <div class="memory-loading">加载中...</div>
+            </div>
+          </div>
+
+          <div class="chat-container" id="chatContainer">
+            <div class="empty-state">
+              <div class="empty-icon">📋</div>
+              <p>输入CT/MRI等检查关键词，生成结构化影像报告</p>
+              <p class="hint">例如：CT脑出血、MRI膝关节、脑梗</p>
+            </div>
+          </div>
+
+          <div class="input-area">
+            <textarea
+              id="userInput"
+              placeholder="输入检查关键词，如：CT脑出血、脑梗..."
+              rows="2"
+              autofocus
+            ></textarea>
+            <button id="btnSend" class="btn btn-primary">
+              <span class="btn-text">发送</span>
+              <span class="btn-loading" style="display: none">⏳ 生成中...</span>
+            </button>
+          </div>
+
+          <div class="status-bar" id="statusBar">
+            <span id="statusText">就绪</span>
+          </div>
         </div>
-      </div>
 
-      <!-- 聊天区域 -->
-      <div class="chat-container" id="chatContainer">
-        <div class="empty-state">
-          <div class="empty-icon">📋</div>
-          <p>输入CT/MRI等检查关键词，生成结构化影像报告</p>
-          <p class="hint">例如：CT脑出血、MRI膝关节、脑梗</p>
+        <!-- 知识库页面 -->
+        <div class="page" id="pageKB">
+          <header class="header">
+            <h1>知识库管理</h1>
+            <p class="subtitle">管理报告模板、向量库与元数据</p>
+          </header>
+
+          <div class="kb-body">
+            <div class="kb-status">
+              <div class="kb-stat">
+                <span class="kb-stat-label">向量总数</span>
+                <span class="kb-stat-value" id="kbTotal">-</span>
+              </div>
+              <div class="kb-stat">
+                <span class="kb-stat-label">切片文件</span>
+                <span class="kb-stat-value" id="kbMdCount">-</span>
+              </div>
+              <div class="kb-stat">
+                <span class="kb-stat-label">元数据</span>
+                <span class="kb-stat-value" id="kbMeta">-</span>
+              </div>
+            </div>
+
+            <div class="kb-files" id="kbFiles">
+              <div class="kb-files-header">📁 服务器文件</div>
+              <div class="kb-files-list" id="kbFilesList"></div>
+            </div>
+
+            <div class="kb-actions">
+              <button id="btnUploadXlsx" class="btn btn-primary" title="上传 xlsx 模板文件，自动切片为 md 文件">📤 上传xlsx</button>
+              <button id="btnBuildIncremental" class="btn btn-primary" title="扫描新增切片，向量化后追加到向量库">增量构建</button>
+              <button id="btnBuildRebuild" class="btn btn-danger" title="清空向量库，全量重新向量化">全量重建</button>
+              <button id="btnExtractMeta" class="btn btn-outline" title="从 xlsx 提取元数据，生成 metadata.json">提取元数据</button>
+            </div>
+
+            <input type="file" id="xlsxInput" accept=".xlsx" style="display: none" />
+
+            <div class="kb-log" id="kbLog" style="display: none">
+              <div class="kb-log-header">📋 执行日志</div>
+              <div class="kb-log-content" id="kbLogContent"></div>
+            </div>
+          </div>
         </div>
-      </div>
-
-      <!-- 输入区域 -->
-      <div class="input-area">
-        <textarea
-          id="userInput"
-          placeholder="输入检查关键词，如：CT脑出血、脑梗..."
-          rows="2"
-          autofocus
-        ></textarea>
-        <button id="btnSend" class="btn btn-primary">
-          <span class="btn-text">发送</span>
-          <span class="btn-loading" style="display: none">⏳ 生成中...</span>
-        </button>
-      </div>
-
-      <!-- 状态栏 -->
-      <div class="status-bar" id="statusBar">
-        <span id="statusText">就绪</span>
       </div>
     </div>
 
-    <script src="/static/app.js?v=6"></script>
+    <script src="/static/app.js?v=10"></script>
   </body>
 </html>

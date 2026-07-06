@@ -15,16 +15,22 @@ import os
 from openpyxl import load_workbook
 
 
-def extract_metadata(input_dir, output_path=None):
+def extract_metadata(input_dir, output_path=None, progress_callback=None):
     """从 xlsx 文件中提取去重的元数据。
 
     Args:
         input_dir: xlsx 文件所在目录
         output_path: 输出 JSON 文件路径，默认为 input_dir/metadata.json
+        progress_callback: 进度回调，接收 dict {"level": "info"|"error"|"done", "msg": str}
 
     Returns:
         dict: 包含 检查类型, 部位, 检查项目, 诊断结论 四个去重列表
     """
+    def _log(msg, level="info"):
+        print(msg, flush=True)
+        if progress_callback:
+            progress_callback({"level": level, "msg": msg})
+
     check_types = set()
     parts = set()
     projects = set()
@@ -36,12 +42,12 @@ def extract_metadata(input_dir, output_path=None):
     ]
 
     if not xlsx_files:
-        print(f"在 {input_dir} 中未找到 xlsx 文件", flush=True)
+        _log(f"在 {input_dir} 中未找到 xlsx 文件", "error")
         return None
 
     for fname in sorted(xlsx_files):
         fpath = os.path.join(input_dir, fname)
-        print(f"处理: {fname}", flush=True)
+        _log(f"处理: {fname}")
         wb = load_workbook(fpath, read_only=True)
         ws = wb.active
 
@@ -73,12 +79,13 @@ def extract_metadata(input_dir, output_path=None):
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
 
-    print(f"\n提取完成:", flush=True)
-    print(f"  检查类型: {len(check_types)} 种 → {sorted(check_types)}", flush=True)
-    print(f"  部位: {len(parts)} 种 → {sorted(parts)}", flush=True)
-    print(f"  检查项目: {len(projects)} 种", flush=True)
-    print(f"  诊断结论: {len(diagnoses)} 种", flush=True)
-    print(f"\n输出文件: {output_path}", flush=True)
+    _log(f"提取完成:")
+    _log(f"  检查类型: {len(check_types)} 种 → {sorted(check_types)}")
+    _log(f"  部位: {len(parts)} 种 → {sorted(parts)}")
+    _log(f"  检查项目: {len(projects)} 种")
+    _log(f"  诊断结论: {len(diagnoses)} 种")
+    _log(f"输出文件: {output_path}")
+    _log("__DONE__", "done")
 
     return metadata
 

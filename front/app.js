@@ -12,6 +12,16 @@ const btnMemory = document.getElementById("btnMemory");
 const btnMemoryClose = document.getElementById("btnMemoryClose");
 const memoryPanel = document.getElementById("memoryPanel");
 const memoryPanelBody = document.getElementById("memoryPanelBody");
+const kbTotal = document.getElementById("kbTotal");
+const kbMdCount = document.getElementById("kbMdCount");
+const kbMeta = document.getElementById("kbMeta");
+const btnBuildIncremental = document.getElementById("btnBuildIncremental");
+const btnBuildRebuild = document.getElementById("btnBuildRebuild");
+const btnExtractMeta = document.getElementById("btnExtractMeta");
+const btnUploadXlsx = document.getElementById("btnUploadXlsx");
+const xlsxInput = document.getElementById("xlsxInput");
+const kbLog = document.getElementById("kbLog");
+const kbLogContent = document.getElementById("kbLogContent");
 const statusText = document.getElementById("statusText");
 
 // 状态
@@ -167,6 +177,287 @@ function renderMemoryPanel(data) {
   }
 
   memoryPanelBody.innerHTML = html;
+}
+
+// ==================== 页面切换 ====================
+
+const sidebarBtns = document.querySelectorAll(".sidebar-btn");
+const pages = document.querySelectorAll(".page");
+
+sidebarBtns.forEach(btn => {
+  btn.addEventListener("click", () => {
+    const page = btn.dataset.page;
+    sidebarBtns.forEach(b => b.classList.remove("active"));
+    btn.classList.add("active");
+    pages.forEach(p => p.classList.remove("active"));
+    const target = document.getElementById(page === "agent" ? "pageAgent" : "pageKB");
+    if (target) target.classList.add("active");
+    if (page === "kb") {
+      refreshKBStatus();
+    }
+  });
+});
+
+// ==================== 知识库管理 ====================
+
+let kbAbortController = null;
+
+async function refreshKBStatus() {
+  try {
+    const resp = await fetch(`${API_BASE}/kb/status?t=${Date.now()}`);
+    const data = await resp.json();
+    kbTotal.textContent = data.total !== undefined ? data.total : "-";
+    kbMdCount.textContent = data.md_count !== undefined ? data.md_count : "-";
+    kbMeta.textContent = data.metadata_exists ? "✅ 已生成" : "❌ 未生成";
+    kbMeta.style.color = data.metadata_exists ? "#2e7d32" : "#e53935";
+  } catch (e) {
+    console.error("[KB] 获取状态失败:", e);
+  }
+  refreshKBFiles();
+}
+
+async function refreshKBFiles() {
+  try {
+    const resp = await fetch(`${API_BASE}/kb/files?t=${Date.now()}`);
+    const data = await resp.json();
+    const files = data.files || [];
+    const kbFiles = document.getElementById("kbFiles");
+    const kbFilesList = document.getElementById("kbFilesList");
+    kbFiles.style.display = "block";
+    if (files.length === 0) {
+      kbFilesList.innerHTML = `<div class="kb-file-item kb-file-empty">暂无文件，请上传 xlsx</div>`;
+      return;
+    }
+    kbFilesList.innerHTML = files.map(f => {
+      const date = new Date(f.mtime * 1000).toLocaleString("zh-CN");
+      const sizeKB = (f.size / 1024).toFixed(1);
+      return `<div class="kb-file-item">
+        <span class="kb-file-name">📄 ${escapeHtml(f.name)}</span>
+        <span class="kb-file-info">${f.slice_count} 切片 · ${sizeKB} KB · ${date}</span>
+      </div>`;
+    }).join("");
+  } catch (e) {
+    console.error("[KB] 获取文件列表失败:", e);
+  }
+}
+
+function setKBBtnsDisabled(disabled) {
+  btnUploadXlsx.disabled = disabled;
+  btnBuildIncremental.disabled = disabled;
+  btnBuildRebuild.disabled = disabled;
+  btnExtractMeta.disabled = disabled;
+  if (disabled) {
+    btnUploadXlsx.classList.add("btn-disabled");
+    btnBuildIncremental.classList.add("btn-disabled");
+    btnBuildRebuild.classList.add("btn-disabled");
+    btnExtractMeta.classList.add("btn-disabled");
+  } else {
+    btnUploadXlsx.classList.remove("btn-disabled");
+    btnBuildIncremental.classList.remove("btn-disabled");
+    btnBuildRebuild.classList.remove("btn-disabled");
+    btnExtractMeta.classList.remove("btn-disabled");
+  }
+}
+
+async function runKBBuild(rebuild) {
+  if (kbAbortController) {
+    kbAbortController.abort();
+  }
+  kbAbortController = new AbortController();
+
+  setKBBtnsDisabled(true);
+  kbLog.style.display = "block";
+  kbLogContent.innerHTML = "";
+
+  const mode = rebuild ? "全量重建" : "增量构建";
+  appendKBLog(`[${mode}] 开始执行...`, "info");
+
+  try {
+    const resp = await fetch(`${API_BASE}/kb/build`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rebuild, batch_size: 16 }),
+      signal: kbAbortController.signal,
+    });
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop();
+      for (const line of lines) {
+        if (line.startsWith("data: ")) {
+          const payload = line.slice(6);
+          if (payload === "[DONE]") {
+            appendKBLog("✅ 构建完成", "done");
+            await refreshKBStatus();
+            return;
+          }
+          try {
+            const event = JSON.parse(payload);
+            const level = event.level || "info";
+            appendKBLog(event.msg || "", level);
+          } catch (e) {
+            appendKBLog(payload, "info");
+          }
+        }
+      }
+    }
+  } catch (e) {
+    if (e.name === "AbortError") {
+      appendKBLog("⚠️ 操作已取消", "error");
+    } else {
+      appendKBLog(`❌ 错误: ${e.message}`, "error");
+    }
+  } finally {
+    setKBBtnsDisabled(false);
+    kbAbortController = null;
+  }
+}
+
+async function runExtractMetadata() {
+  if (kbAbortController) {
+    kbAbortController.abort();
+  }
+  kbAbortController = new AbortController();
+
+  setKBBtnsDisabled(true);
+  kbLog.style.display = "block";
+  kbLogContent.innerHTML = "";
+  appendKBLog("[提取元数据] 开始执行...", "info");
+
+  try {
+    const resp = await fetch(`${API_BASE}/kb/extract-metadata`, {
+      method: "POST",
+      signal: kbAbortController.signal,
+    });
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop();
+      for (const line of lines) {
+        if (line.startsWith("data: ")) {
+          const payload = line.slice(6);
+          if (payload === "[DONE]") {
+            appendKBLog("✅ 提取完成", "done");
+            await refreshKBStatus();
+            return;
+          }
+          try {
+            const event = JSON.parse(payload);
+            const level = event.level || "info";
+            appendKBLog(event.msg || "", level);
+          } catch (e) {
+            appendKBLog(payload, "info");
+          }
+        }
+      }
+    }
+  } catch (e) {
+    if (e.name === "AbortError") {
+      appendKBLog("⚠️ 操作已取消", "error");
+    } else {
+      appendKBLog(`❌ 错误: ${e.message}`, "error");
+    }
+  } finally {
+    setKBBtnsDisabled(false);
+    kbAbortController = null;
+  }
+}
+
+function appendKBLog(msg, level) {
+  const div = document.createElement("div");
+  div.className = `kb-log-line kb-log-${level}`;
+  div.textContent = msg;
+  kbLogContent.appendChild(div);
+  kbLogContent.scrollTop = kbLogContent.scrollHeight;
+}
+
+btnBuildIncremental.addEventListener("click", () => runKBBuild(false));
+btnBuildRebuild.addEventListener("click", () => runKBBuild(true));
+btnExtractMeta.addEventListener("click", () => runExtractMetadata());
+
+// 上传 xlsx 并切片
+btnUploadXlsx.addEventListener("click", () => xlsxInput.click());
+xlsxInput.addEventListener("change", () => {
+  if (xlsxInput.files.length > 0) {
+    runUploadXlsx(xlsxInput.files[0]);
+  }
+});
+
+async function runUploadXlsx(file) {
+  if (kbAbortController) {
+    kbAbortController.abort();
+  }
+  kbAbortController = new AbortController();
+
+  setKBBtnsDisabled(true);
+  kbLog.style.display = "block";
+  kbLogContent.innerHTML = "";
+  appendKBLog(`[上传切片] ${file.name}`, "info");
+
+  try {
+    const formData = new FormData();
+    formData.append("file", file);
+
+    const resp = await fetch(`${API_BASE}/kb/upload`, {
+      method: "POST",
+      body: formData,
+      signal: kbAbortController.signal,
+    });
+
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop();
+      for (const line of lines) {
+        if (line.startsWith("data: ")) {
+          const payload = line.slice(6);
+          if (payload === "[DONE]") {
+            appendKBLog("✅ 上传切片完成", "done");
+            xlsxInput.value = "";
+            await refreshKBStatus();
+            return;
+          }
+          try {
+            const event = JSON.parse(payload);
+            const level = event.level || "info";
+            appendKBLog(event.msg || "", level);
+          } catch (e) {
+            appendKBLog(payload, "info");
+          }
+        }
+      }
+    }
+  } catch (e) {
+    if (e.name === "AbortError") {
+      appendKBLog("⚠️ 操作已取消", "error");
+    } else {
+      appendKBLog(`❌ 错误: ${e.message}`, "error");
+    }
+  } finally {
+    setKBBtnsDisabled(false);
+    kbAbortController = null;
+    xlsxInput.value = "";
+  }
 }
 
 // 取消当前 SSE 请求

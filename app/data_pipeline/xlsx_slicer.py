@@ -41,12 +41,18 @@ def slice_to_md(header, row, sheet_name="Sheet"):
     return "\n".join(lines)
 
 
-def process_file(filepath, output_dir):
+def process_file(filepath, output_dir, progress_callback=None):
+    def _log(msg, level="info"):
+        print(msg, flush=True)
+        if progress_callback:
+            progress_callback({"level": level, "msg": msg})
+
     basename = os.path.splitext(os.path.basename(filepath))[0]
+    _log(f"读取文件: {os.path.basename(filepath)}")
     header, data_rows = xlsx_to_slices(filepath)
 
     if not header:
-        print(f"  跳过空文件: {filepath}")
+        _log(f"跳过空文件: {filepath}", "error")
         return 0
 
     count = 0
@@ -58,6 +64,7 @@ def process_file(filepath, output_dir):
             f.write(md_content)
         count += 1
 
+    _log(f"生成 {count} 个切片")
     return count
 
 

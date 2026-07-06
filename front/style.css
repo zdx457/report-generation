@@ -31,19 +31,97 @@ body {
   background: var(--bg);
   color: var(--text);
   height: 100vh;
-  display: flex;
-  justify-content: center;
-  align-items: center;
+  overflow: hidden;
 }
 
-.container {
-  width: 100%;
-  max-width: 900px;
+/* 应用整体布局 */
+.app {
+  display: flex;
   height: 100vh;
+  width: 100%;
+}
+
+/* 左侧导航 */
+.sidebar {
+  width: 72px;
+  min-width: 72px;
+  background: #1a1a2e;
   display: flex;
   flex-direction: column;
+  align-items: center;
+  padding: 16px 0;
+  gap: 24px;
+  z-index: 10;
+}
+
+.sidebar-brand {
+  font-size: 28px;
+  line-height: 1;
+}
+
+.sidebar-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  padding: 0 8px;
+}
+
+.sidebar-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 12px 0;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: #888;
+  cursor: pointer;
+  transition: all 0.2s;
+  font-size: 12px;
+  width: 100%;
+}
+
+.sidebar-btn:hover {
+  background: rgba(255, 255, 255, 0.1);
+  color: #ccc;
+}
+
+.sidebar-btn.active {
+  background: rgba(64, 150, 255, 0.2);
+  color: #4096ff;
+}
+
+.sidebar-icon {
+  font-size: 22px;
+  line-height: 1;
+}
+
+.sidebar-label {
+  font-size: 11px;
+  font-weight: 500;
+}
+
+/* 右侧主区域 */
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  min-width: 0;
   background: var(--card-bg);
-  box-shadow: var(--shadow);
+}
+
+.page {
+  display: none;
+  flex-direction: column;
+  height: 100%;
+  overflow: hidden;
+}
+
+.page.active {
+  display: flex;
 }
 
 /* 头部 */
@@ -52,6 +130,61 @@ body {
   border-bottom: 1px solid var(--border);
   text-align: center;
   flex-shrink: 0;
+  max-width: 900px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+/* 工具栏 */
+.toolbar {
+  display: flex;
+  gap: 8px;
+  padding: 10px 24px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+  max-width: 900px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+/* 聊天区域 */
+.chat-container {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  max-width: 900px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+/* 输入区域 */
+.input-area {
+  display: flex;
+  gap: 10px;
+  padding: 14px 24px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+  max-width: 900px;
+  width: 100%;
+  margin: 0 auto;
+}
+
+/* 状态栏 */
+.status-bar {
+  padding: 8px 24px;
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+  max-width: 900px;
+  width: 100%;
+  margin: 0 auto;
+  font-size: 12px;
+  color: var(--text-secondary);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
 }
 
 .header h1 {
@@ -64,25 +197,6 @@ body {
   font-size: 13px;
   color: var(--text-secondary);
   margin-top: 4px;
-}
-
-/* 工具栏 */
-.toolbar {
-  display: flex;
-  gap: 8px;
-  padding: 10px 24px;
-  border-bottom: 1px solid var(--border);
-  flex-shrink: 0;
-}
-
-/* 聊天区域 */
-.chat-container {
-  flex: 1;
-  overflow-y: auto;
-  padding: 20px 24px;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
 }
 
 .empty-state {
@@ -411,16 +525,6 @@ body {
   display: none;
 }
 
-/* 输入区域 */
-.input-area {
-  display: flex;
-  gap: 10px;
-  padding: 16px 24px;
-  border-top: 1px solid var(--border);
-  flex-shrink: 0;
-  background: var(--card-bg);
-}
-
 .input-area textarea {
   flex: 1;
   padding: 10px 14px;
@@ -475,18 +579,6 @@ body {
 .btn-outline:hover {
   border-color: var(--primary);
   color: var(--primary);
-}
-
-/* 状态栏 */
-.status-bar {
-  padding: 8px 24px;
-  border-top: 1px solid var(--border);
-  font-size: 12px;
-  color: var(--text-secondary);
-  flex-shrink: 0;
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
 }
 
 /* 滚动条 */
@@ -720,4 +812,154 @@ body {
   height: 100%;
   background: rgba(0, 0, 0, 0.35);
   z-index: 999;
+}
+
+/* ==================== 知识库管理页面 ==================== */
+
+.kb-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 20px 24px;
+}
+
+.kb-status {
+  display: flex;
+  gap: 12px;
+  margin-bottom: 20px;
+}
+
+.kb-stat {
+  flex: 1;
+  background: #f7f8fa;
+  border: 1px solid #e8e8e8;
+  border-radius: 8px;
+  padding: 12px 16px;
+  text-align: center;
+}
+
+.kb-stat-label {
+  display: block;
+  font-size: 12px;
+  color: #999;
+  margin-bottom: 4px;
+}
+
+.kb-stat-value {
+  display: block;
+  font-size: 20px;
+  font-weight: 700;
+  color: #333;
+}
+
+.kb-actions {
+  display: flex;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+
+.btn-danger {
+  background: #e53935;
+  color: #fff;
+  border: 1px solid #e53935;
+}
+
+.btn-danger:hover {
+  background: #c62828;
+  border-color: #c62828;
+}
+
+.btn-disabled {
+  opacity: 0.5;
+  pointer-events: none;
+}
+
+.kb-files {
+  margin-bottom: 16px;
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.kb-files-header {
+  background: #f5f5f5;
+  padding: 8px 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #555;
+  border-bottom: 1px solid #e0e0e0;
+}
+
+.kb-files-list {
+  max-height: 150px;
+  overflow-y: auto;
+}
+
+.kb-file-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 8px 14px;
+  border-bottom: 1px solid #f0f0f0;
+  font-size: 13px;
+}
+
+.kb-file-item:last-child {
+  border-bottom: none;
+}
+
+.kb-file-name {
+  color: #333;
+  font-weight: 500;
+}
+
+.kb-file-info {
+  color: #999;
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.kb-file-empty {
+  color: #aaa;
+  justify-content: center;
+}
+
+.kb-log {
+  background: #1e1e1e;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.kb-log-header {
+  padding: 8px 14px;
+  font-size: 13px;
+  color: #aaa;
+  background: #2a2a2a;
+  border-bottom: 1px solid #333;
+}
+
+.kb-log-content {
+  max-height: 300px;
+  overflow-y: auto;
+  padding: 12px 14px;
+  font-family: "Consolas", "Monaco", "Courier New", monospace;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.kb-log-line {
+  padding: 2px 0;
+  color: #d4d4d4;
+}
+
+.kb-log-info {
+  color: #d4d4d4;
+}
+
+.kb-log-error {
+  color: #f48771;
+}
+
+.kb-log-done {
+  color: #89d185;
+  font-weight: 600;
 }

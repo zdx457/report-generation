@@ -42,7 +42,7 @@ rerank:
 # -------------------------------------------------------------
 retrieval:
   # Milvus Lite 数据库文件路径（相对于项目根目录）
-  db_path: "./data_pipeline/milvus_lite.db"
+  db_path: "./app/data_pipeline/milvus_lite.db"
   # 集合名称
   collection_name: "report_slices"
   # 向量检索召回数
