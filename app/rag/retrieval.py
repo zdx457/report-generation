@@ -19,13 +19,14 @@
 import os
 
 from pymilvus import MilvusClient
+from config import get_collection_name
 
 try:
     from .query_rewrite import parse_query_keywords
 except ImportError:
     from query_rewrite import parse_query_keywords
 
-COLLECTION_NAME = "report_slices"
+COLLECTION_NAME = get_collection_name()
 
 OUTPUT_FIELDS = ["text", "source", "检查类型", "部位", "检查项目", "诊断结论"]
 

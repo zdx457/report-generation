@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>影像报告生成系统</title>
-    <link rel="stylesheet" href="/static/style.css" />
+    <link rel="stylesheet" href="/static/style.css?v=5" />
   </head>
   <body>
     <div class="container">
@@ -17,7 +17,18 @@
       <!-- 会话控制栏 -->
       <div class="toolbar">
         <button id="btnClear" class="btn btn-outline">清空会话</button>
-        <button id="btnInfo" class="btn btn-outline">会话状态</button>
+        <button id="btnMemory" class="btn btn-outline">短期记忆</button>
+      </div>
+
+      <!-- 短期记忆面板 -->
+      <div class="memory-panel" id="memoryPanel" style="display: none;">
+        <div class="memory-panel-header">
+          <h3>短期记忆详情</h3>
+          <button class="memory-panel-close" id="btnMemoryClose">✕</button>
+        </div>
+        <div class="memory-panel-body" id="memoryPanelBody">
+          <div class="memory-loading">加载中...</div>
+        </div>
       </div>
 
       <!-- 聊天区域 -->
@@ -49,6 +60,6 @@
       </div>
     </div>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=6"></script>
   </body>
 </html>

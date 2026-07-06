@@ -1,0 +1,73 @@
+# 影像报告生成系统 - 配置文件
+# =============================================================
+
+# LLM 生成配置
+# -------------------------------------------------------------
+llm:
+  # 生成模型 API 地址（OpenAI 兼容格式）
+  base_url: "http://14.22.86.97:11001/v1/chat/completions"
+  # 生成模型名称
+  model: "qwen36_27b"
+  # 最大生成长度
+  max_tokens: 2048
+  # 温度
+  temperature: 0.3
+
+# 问答改写、意图识别使用同一个 LLM，但可能模型不同
+llm_rewrite:
+  base_url: "http://14.22.86.97:11001/v1/chat/completions"
+  model: "qwen36_27b_lora"
+
+# Embedding 配置
+# -------------------------------------------------------------
+embedding:
+  # Embedding API 地址（OpenAI 兼容格式）
+  base_url: "http://14.22.83.225:11002/v1/embeddings"
+  # Embedding 模型名称
+  model: "bge-m3"
+  # 向量维度（根据模型调整）
+  dimension: 1024
+
+# Rerank 配置（可选，使用 SiliconFlow API）
+# -------------------------------------------------------------
+rerank:
+  # Rerank API 地址
+  base_url: "https://api.siliconflow.cn/v1/rerank"
+  # Rerank 模型名称
+  model: "Qwen/Qwen3-VL-Reranker-8B"
+  # API Key（从环境变量读取更安全，这里留空）
+  api_key: ""
+
+# 检索配置
+# -------------------------------------------------------------
+retrieval:
+  # Milvus Lite 数据库文件路径（相对于项目根目录）
+  db_path: "./data_pipeline/milvus_lite.db"
+  # 集合名称
+  collection_name: "report_slices"
+  # 向量检索召回数
+  rag_top_k: 10
+  # Rerank 后保留的 topN
+  rerank_top_k: 3
+
+# 短期记忆配置
+# -------------------------------------------------------------
+short_term_memory:
+  # 最大轮数（超过则压缩淘汰）
+  max_rounds: 5
+  # 实体权重衰减因子（0.9 表示每轮递减 10%）
+  decay_factor: 0.9
+
+# 服务配置
+# -------------------------------------------------------------
+server:
+  # 监听端口
+  port: 8000
+  # 主机地址
+  host: "0.0.0.0"
+
+# 路径配置
+# -------------------------------------------------------------
+paths:
+  # 标准术语 metadata 路径（相对于项目根目录）
+  metadata: "./app/data_pipeline/report_template/metadata.json"

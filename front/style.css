@@ -339,6 +339,39 @@ body {
   font-weight: 500;
 }
 
+.rerank-text-toggle {
+  font-size: 11px;
+  color: var(--primary);
+  cursor: pointer;
+  margin-left: 28px;
+  margin-bottom: 4px;
+  user-select: none;
+}
+
+.rerank-text-toggle:hover {
+  text-decoration: underline;
+}
+
+.rerank-text-content {
+  margin: 4px 0 8px 28px;
+  padding: 8px 12px;
+  background: #fff;
+  border: 1px solid #e8e8e8;
+  border-radius: 6px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+
+.rerank-text-content pre {
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.6;
+  color: #555;
+}
+
 /* 检索结果内容 */
 .search-result-content {
   max-height: none;
@@ -490,4 +523,201 @@ body {
   .input-area {
     padding: 12px 16px;
   }
+}
+
+/* ========== 短期记忆面板 ========== */
+.memory-panel {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 90%;
+  max-width: 700px;
+  max-height: 80vh;
+  background: var(--card-bg);
+  border-radius: 12px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
+  z-index: 1000;
+  display: flex;
+  flex-direction: column;
+  animation: memorySlideIn 0.25s ease;
+}
+
+@keyframes memorySlideIn {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -48%);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, -50%);
+  }
+}
+
+.memory-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.memory-panel-header h3 {
+  font-size: 17px;
+  color: var(--primary);
+  font-weight: 700;
+}
+
+.memory-panel-close {
+  background: none;
+  border: none;
+  font-size: 20px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 4px 8px;
+  border-radius: 4px;
+  transition: all 0.2s;
+  line-height: 1;
+}
+
+.memory-panel-close:hover {
+  background: #f0f0f0;
+  color: var(--text);
+}
+
+.memory-panel-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 16px 20px;
+}
+
+.memory-loading,
+.memory-error {
+  text-align: center;
+  padding: 40px;
+  color: var(--text-secondary);
+  font-size: 14px;
+}
+
+.memory-error {
+  color: #ff4d4f;
+}
+
+.memory-empty {
+  text-align: center;
+  padding: 20px;
+  color: var(--text-secondary);
+  font-size: 14px;
+}
+
+.memory-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 16px;
+  padding: 12px;
+  background: #f6f8fa;
+  border-radius: 8px;
+}
+
+.memory-stat {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+
+.memory-stat strong {
+  color: var(--primary);
+}
+
+.memory-section {
+  margin-bottom: 16px;
+}
+
+.memory-section h4 {
+  font-size: 14px;
+  color: var(--text);
+  font-weight: 600;
+  margin-bottom: 8px;
+  padding-bottom: 6px;
+  border-bottom: 2px solid var(--primary);
+}
+
+.memory-turn {
+  background: #fafafa;
+  border: 1px solid #e8e8e8;
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin-bottom: 8px;
+}
+
+.memory-turn-header {
+  font-size: 12px;
+  color: var(--primary);
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+
+.memory-turn-user,
+.memory-turn-assistant {
+  font-size: 13px;
+  line-height: 1.6;
+  margin-bottom: 4px;
+  word-break: break-word;
+}
+
+.memory-turn-user {
+  color: #555;
+}
+
+.memory-turn-assistant {
+  color: #333;
+}
+
+.memory-role-label {
+  font-weight: 600;
+  color: var(--text-secondary);
+  margin-right: 4px;
+}
+
+.memory-entities {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.memory-entity {
+  font-size: 13px;
+  padding: 6px 10px;
+  background: #f6ffed;
+  border: 1px solid #b7eb8f;
+  border-radius: 6px;
+  line-height: 1.5;
+}
+
+.memory-entity-key {
+  font-weight: 600;
+  color: #389e0d;
+}
+
+.memory-summary {
+  font-size: 13px;
+  padding: 6px 10px;
+  margin-bottom: 4px;
+  background: #fffbe6;
+  border: 1px solid #ffe58f;
+  border-radius: 6px;
+  line-height: 1.5;
+  color: #555;
+}
+
+/* 面板遮罩层 */
+.memory-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  background: rgba(0, 0, 0, 0.35);
+  z-index: 999;
 }

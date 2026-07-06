@@ -13,12 +13,13 @@ import os
 
 import requests
 from dotenv import load_dotenv
+from config import get_rerank_base_url, get_rerank_model, get_rerank_api_key
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".env"))
 
-RERANK_URL = os.environ.get("RERANK_URL", "https://api.siliconflow.cn/v1/rerank")
-RERANK_MODEL = os.environ.get("RERANK_MODEL", "Qwen/Qwen3-VL-Reranker-8B")
-SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY", "")
+RERANK_URL = get_rerank_base_url()
+RERANK_MODEL = get_rerank_model()
+SILICONFLOW_API_KEY = get_rerank_api_key()
 
 
 def rerank_documents(query, documents, top_n=3):

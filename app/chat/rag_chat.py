@@ -284,6 +284,22 @@ REACT_SYSTEM_PROMPT = """你是一个具备多步推理能力的 AI 助手，你
    - 信息不足 → 继续 [ACTION: search] 或 [CONTINUE]
    - 信息充分 → 输出 [FINAL] 给出最终回答
 
+## 修改/编辑场景（重要）
+
+当用户要求修改、调整、变更、替换之前生成的内容时，**绝对不要检索**：
+- 用户说的是"修改CT值为70"、"把诊断改成XX"、"调整一下格式"等 → 这是编辑请求
+- 编辑请求不需要检索知识库，知识库里没有用户想要的具体数值
+- 直接基于对话历史中的上一轮报告，找到要修改的部分，用 [CONTINUE] 推理修改方案，然后 [FINAL] 输出修改后的完整报告
+- 修改时只改变用户指定的内容，其余部分保持原样
+
+## 多病变追加规则
+
+当用户输入的是与上一轮不同的新病变时，需要将新旧病变合并到同一份报告中：
+- 检索新病变的信息
+- 将新病变的「影像学表现」追加到上一轮报告的对应模块中，两个病变之间空一行分隔
+- 将新病变的「诊断意见」追加到上一轮报告的对应模块中，用分号分隔
+- 如果用户输入的是修改请求（见上条规则），则不要追加，只修改
+
 ## 重要规则
 
 - 第一轮不要直接输出 [FINAL]，至少先检索或推理一步
@@ -331,8 +347,10 @@ def generate_merged_report(accumulated_searches, base_sys_prompt):
     return chat_stream(messages, max_tokens=4096, temperature=0.3, debug=True)
 
 
-def run_react_with_events(query, session_id, stm, ltm, client, accumulated_searches, _emit):
+def run_react_with_events(query, session_id, stm, ltm, client, accumulated_searches, last_report, _emit):
     """Web 模式的 ReAct 管道，通过 _emit 发送 SSE 事件"""
+
+    accumulated_searches.clear()
 
     if is_too_vague(query):
         clarification = get_clarification(query)
@@ -368,6 +386,8 @@ def run_react_with_events(query, session_id, stm, ltm, client, accumulated_searc
     messages = [{"role": "system", "content": sys_prompt}]
     if pref_prompt:
         messages.append({"role": "system", "content": pref_prompt})
+    # if last_report and last_report[0]:
+    #     messages.append({"role": "system", "content": f"上一轮生成的报告：\n{last_report[0]}"})
     for msg in history:
         if msg.get("content", "").strip():
             messages.append(msg)
@@ -441,7 +461,11 @@ def run_react_with_events(query, session_id, stm, ltm, client, accumulated_searc
             })
 
         # 生成报告：只有当累积了多个不同病变时才合并输出
-        if len(accumulated_searches) >= 2:
+        if last_report and last_report[0]:
+    # 跨轮：新检索 + 上一轮报告 → 合并
+            final_answer = generate_merged_report(accumulated_searches, base_sys_prompt, last_report[0])
+
+        elif len(accumulated_searches) >= 2:
             try:
                 final_answer = generate_merged_report(accumulated_searches, base_sys_prompt)
             except Exception as e:
@@ -454,8 +478,8 @@ def run_react_with_events(query, session_id, stm, ltm, client, accumulated_searc
 
     finally:
         if final_answer:
+            last_report[0] = final_answer
             stm.add_turn(session_id, query, final_answer)
-            ltm.sync_from_short_term(stm, session_id)
 
 
 def web_main(port=8000):
@@ -493,6 +517,7 @@ def web_main(port=8000):
                 "ltm": ltm,
                 "client": client,
                 "accumulated_searches": [],
+                "last_report": [""],
             }
         return _web_sessions[session_id]
 
@@ -525,6 +550,7 @@ def web_main(port=8000):
                         query, session_id,
                         session["stm"], session["ltm"], session["client"],
                         session["accumulated_searches"],
+                        session["last_report"],
                         _emit_sse,
                     )
                 except Exception as e:

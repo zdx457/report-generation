@@ -26,16 +26,15 @@
 """
 import json
 import os
+import re
 
 import requests
+from config import get_rewrite_base_url, get_rewrite_model, get_metadata_path
 
-CHAT_URL = os.environ.get("CHAT_URL", "http://14.22.86.97:11001/v1/chat/completions")
-CHAT_MODEL = os.environ.get("CHAT_MODEL", "qwen36_27b_lora")
+CHAT_URL = get_rewrite_base_url()
+CHAT_MODEL = get_rewrite_model()
 
-METADATA_PATH = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)),
-    "..", "data_pipeline", "report_template", "metadata.json",
-)
+METADATA_PATH = get_metadata_path()
 
 
 def _load_metadata():
@@ -279,6 +278,9 @@ def standardize_query(query):
         if _is_standalone_part(query, alias):
             query = query.replace(alias, standard)
             break
+    # 中英文/数字之间加空格: "CT脑出血" → "CT 脑出血"
+    query = re.sub(r"([a-zA-Z0-9]+)([\u4e00-\u9fff])", r"\1 \2", query)
+    query = re.sub(r"([\u4e00-\u9fff])([a-zA-Z0-9]+)", r"\1 \2", query)
     return query
 
 
