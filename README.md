@@ -25,7 +25,7 @@ cp .env.example .env
 | `EMBED_URL`           | Embedding API 地址   | `http://14.22.83.225:11002/v1/embeddings`      |
 | `EMBED_MODEL`         | 向量化模型名称       | `bge-m3`                                       |
 | `CHAT_URL`            | Chat API 地址        | `http://14.22.86.97:11001/v1/chat/completions` |
-| `CHAT_MODEL`          | 生成模型名称         | `qwen36_27b_lora`                              |
+| `CHAT_MODEL`          | 生成模型名称         | `qwen36-27b`                                   |
 | `RERANK_URL`          | Rerank API 地址      | `https://api.siliconflow.cn/v1/rerank`         |
 | `RERANK_MODEL`        | Rerank 模型名称      | `Qwen/Qwen3-VL-Reranker-8B`                    |
 | `SILICONFLOW_API_KEY` | SiliconFlow API 密钥 | （需填入）                                     |

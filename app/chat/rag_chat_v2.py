@@ -41,8 +41,10 @@ from config import (
     get_db_path, get_collection_name,
     get_rag_top_k, get_rerank_top_k,
     get_rerank_api_key,
+    get_max_rounds,
     reload_config,
 )
+from prompt import load_prompt
 
 from data_pipeline.build_vector_db import build_db
 from data_pipeline.extract_metadata import extract_metadata
@@ -73,7 +75,6 @@ CHAT_MODEL = get_llm_model()
 CHAT_API_KEY = get_llm_api_key()
 DB_PATH = get_db_path()
 COLLECTION_NAME = get_collection_name()
-PROMPT_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "rag", "prompt.md")
 
 RAG_TOP_K = get_rag_top_k()
 RERANK_TOP_K = get_rerank_top_k()
@@ -99,10 +100,7 @@ def retry(max_attempts=3, delay=2, exceptions=(requests.RequestException,)):
 
 
 def load_system_prompt():
-    if os.path.exists(PROMPT_FILE):
-        with open(PROMPT_FILE, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    return "你是一个医疗影像报告分析助手。"
+    return load_prompt("report_generation")
 
 
 def get_embedding(text):
@@ -245,115 +243,12 @@ def search_reports(query, top_k=RAG_TOP_K, rerank_top_k=RERANK_TOP_K, client=Non
 
 
 # =============================================================================
-# Stage 1: 意图识别 Prompt
+# 从 prompt 目录加载提示词
 # =============================================================================
-INTENT_PROMPT = """你是一个医疗影像报告助手的意图分类器。根据用户输入，判断用户意图。
-
-## 分类规则
-
-- **SEARCH**：用户要生成、查询、检索影像报告。例如：
-  - "CT 脑出血"
-  - "生成一份胸部CT报告"
-  - "头颅MRI平扫"
-  - "脑梗"
-
-- **EDIT**：用户要修改之前已经生成的内容。例如：
-  - "修改CT值为80"
-  - "把诊断改成脑梗死"
-  - "调整一下格式"
-  - "换成左侧基底节区"
-
-- **CHAT**：闲聊、问候、与报告生成无关的问题。例如：
-  - "你好"
-  - "今天天气怎么样"
-  - "你是什么模型"
-
-## 输出格式
-
-只输出一个单词，不要任何其他内容：
-SEARCH
-或
-EDIT
-或
-CHAT"""
-
-
-# =============================================================================
-# Stage 3A: 结构化提取 Prompt
-# =============================================================================
-STRUCTURE_PROMPT = """你是一个医疗影像报告结构化提取器。根据检索到的参考报告，提取关键信息并生成结构化报告。
-
-## 核心规则
-
-1. **忠实原文**：直接使用参考报告中的原文描述，不修改数值，不脑补缺失信息
-2. **选最高分**：当多条参考的 Rerank 分数接近时，优先使用分数最高的参考
-3. **不补全**：参考中缺少的字段（如左右侧），保留原文表述，不自行补全
-4. **格式规范**：影像学表现中每个句号结尾的句子独占一段
-5. **不重复已有病变**：如果上一轮报告中已包含某病变，请勿重复生成，只提取本次检索结果中新增的病变
-
-## 输出格式
-
-严格输出 JSON，不要输出任何其他内容：
-
-```json
-{
-  "reasoning": "你的推理过程：选择了哪条参考、为什么选择、如何处理",
-  "影像学表现": {
-    "病变名称": "描述内容（每句一段，用换行符\\n分隔）"
-  },
-  "诊断意见": {
-    "病变名称": "诊断意见"
-  }
-}
-```
-
-## 示例
-
-输入参考：
-### 参考1（Rerank分数: 0.6562）
-CT平扫显示右侧基底节区团块状高密度灶，CT值65HU，范围约3.0×1.6cm。中线结构轻度向对侧移位。脑干及小脑未见异常。
-
-输出：
-```json
-{
-  "reasoning": "参考1的Rerank分数最高(0.6562)，描述完整，包含CT值、尺寸、继发改变，选择参考1作为基准。",
-  "影像学表现": {
-    "右侧基底节区脑出血": "CT平扫显示右侧基底节区团块状高密度灶，CT值65HU，范围约3.0×1.6cm。\\n中线结构轻度向对侧移位。\\n脑干及小脑未见异常。"
-  },
-  "诊断意见": {
-    "右侧基底节区脑出血": "右侧基底节区脑出血"
-  }
-}
-```"""
-
-
-# =============================================================================
-# Stage 3B: 精准编辑 Prompt
-# =============================================================================
-EDIT_PROMPT = """你是一个医疗影像报告编辑器。根据用户指令，修改已有报告。
-
-## 规则
-
-1. **只改指定内容**：只修改用户明确要求修改的部分，其余内容保持不变
-2. **Key 不变**：影像学表现和诊断意见的病变名称（Key）不能增删
-3. **不检索**：不需要检索知识库，直接基于已有报告修改
-4. **不添加新病变**：不要添加用户没有要求的病变
-
-## 输出格式
-
-严格输出 JSON，不要输出任何其他内容：
-
-```json
-{
-  "影像学表现": {
-    "病变名称": "修改后的描述"
-  },
-  "诊断意见": {
-    "病变名称": "修改后的诊断意见"
-  }
-}
-```"""
-
+INTENT_PROMPT = load_prompt("intent")
+STRUCTURE_PROMPT = load_prompt("structure")
+EDIT_PROMPT = load_prompt("edit")
+CHAT_SYSTEM_PROMPT = load_prompt("chat")
 
 # =============================================================================
 # Stage 1: 意图识别
@@ -476,7 +371,7 @@ def edit_report(query, last_report, history, _emit=None):
 def chat_reply(query, history, _emit=None):
     """直接回复闲聊"""
     messages = [
-        {"role": "system", "content": "你是一个医疗影像报告助手。请友好、简洁地回答用户问题。"},
+        {"role": "system", "content": CHAT_SYSTEM_PROMPT},
     ]
     for msg in history[-4:]:
         if msg.get("content", "").strip():
@@ -596,6 +491,8 @@ def run_pipeline(query, session_id, stm, ltm, client, last_report, _emit):
         return display_text
 
     elif intent == "SEARCH":
+        if _emit:
+            _emit("search", {"query": enhanced})
         _emit("status", {"message": f"开始检索：{enhanced}"})
         search_result = search_reports(enhanced, client=client, _emit=_emit)
         _emit("status", {"message": "检索完成，开始结构化提取..."})
@@ -663,7 +560,7 @@ def web_main(port=8000):
 
     def _get_or_create_session(session_id):
         if session_id not in _web_sessions:
-            stm = ShortTermMemory()
+            stm = ShortTermMemory(max_rounds=get_max_rounds())
             ltm = LongTermMemory()
             client = MilvusClient(DB_PATH)
             client.load_collection(COLLECTION_NAME)
@@ -1072,7 +969,7 @@ def main():
     print(f"  {'='*60}\n")
 
     SESSION_ID = f"rag_v2_{uuid.uuid4().hex[:8]}"
-    stm = ShortTermMemory()
+    stm = ShortTermMemory(max_rounds=get_max_rounds())
     ltm = LongTermMemory()
     client = MilvusClient(DB_PATH)
     client.load_collection(COLLECTION_NAME)

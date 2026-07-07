@@ -28,7 +28,7 @@ retrieval:
   collection_name: report_slices
   db_path: ./app/data_pipeline/milvus_lite.db
 short_term_memory:
-  max_rounds: 10
+  max_rounds: 5
   decay_factor: 0.9
 active_models:
   chat_llm: qwen36-27b

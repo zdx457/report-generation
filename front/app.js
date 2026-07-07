@@ -1,7 +1,11 @@
 console.log("[APP] app.js v2 已加载, 时间:", new Date().toISOString());
 
-// 会话管理
-const SESSION_ID = "web_" + Math.random().toString(36).slice(2, 10);
+// 会话管理 - 每个对话独立的 session_id
+let SESSION_ID = generateSessionId();
+
+function generateSessionId() {
+  return "web_" + crypto.randomUUID();
+}
 
 // DOM 元素
 const chatContainer = document.getElementById("chatContainer");
@@ -616,6 +620,23 @@ async function sendMessage() {
   chatAbortController = null;
   setProcessing(false);
   updateStatus("就绪");
+
+  // 自动保存对话到历史记录
+  if (!currentConversationId) {
+    currentConversationId = generateConvId();
+    const history = getChatHistory();
+    history.unshift({
+      id: currentConversationId,
+      session_id: SESSION_ID,
+      title: getConversationTitleFromChat(),
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+    });
+    saveChatHistory(history);
+  }
+  saveCurrentConversation();
+  renderChatHistoryList();
+
   console.log("[DEBUG] sendMessage 结束");
 }
 
@@ -927,13 +948,14 @@ function updateStatusText(text) {
 }
 
 function addTokenStream(container, content) {
-  let tokenEl = container.querySelector(".token-stream");
+  const body = container.querySelector(".thinking-body");
+  let tokenEl = body.querySelector(".token-stream");
   if (!tokenEl) {
     tokenEl = document.createElement("div");
     tokenEl.className = "thinking-detail-block token-stream";
     tokenEl.style.cssText =
-      "white-space:pre-wrap;font-family:monospace;font-size:13px;color:#ccc;padding:8px;background:#1a1a2e;border-radius:4px;max-height:300px;overflow-y:auto;";
-    container.appendChild(tokenEl);
+      "white-space:pre-wrap;font-family:monospace;font-size:13px;color:#333;background:#fff;border:1px solid #e8e8e8;border-radius:6px;max-height:300px;overflow-y:auto;";
+    body.appendChild(tokenEl);
   }
   tokenEl.textContent += content;
   tokenEl.scrollTop = tokenEl.scrollHeight;
@@ -944,6 +966,240 @@ function finishThinking(container) {
   if (status) status.textContent = "✅ 完成";
   container.classList.add("thinking-collapsed", "thinking-done");
 }
+
+// ==================== 对话历史管理 ====================
+
+const CHAT_HISTORY_KEY = "chat_history_list";
+const CHAT_MESSAGES_PREFIX = "chat_messages_";
+
+let currentConversationId = null;
+
+function getChatHistory() {
+  try {
+    return JSON.parse(localStorage.getItem(CHAT_HISTORY_KEY) || "[]");
+  } catch (e) {
+    return [];
+  }
+}
+
+function saveChatHistory(list) {
+  localStorage.setItem(CHAT_HISTORY_KEY, JSON.stringify(list));
+}
+
+function getChatMessages(convId) {
+  try {
+    return JSON.parse(localStorage.getItem(CHAT_MESSAGES_PREFIX + convId) || "[]");
+  } catch (e) {
+    return [];
+  }
+}
+
+function saveChatMessages(convId, messages) {
+  localStorage.setItem(CHAT_MESSAGES_PREFIX + convId, JSON.stringify(messages));
+}
+
+function deleteChatMessages(convId) {
+  localStorage.removeItem(CHAT_MESSAGES_PREFIX + convId);
+}
+
+function generateConvId() {
+  return "conv_" + crypto.randomUUID();
+}
+
+function saveCurrentConversation() {
+  const messages = [];
+  chatContainer.querySelectorAll(".message").forEach(msg => {
+    const isUser = msg.classList.contains("user");
+    const isAssistant = msg.classList.contains("assistant");
+    const isSystem = msg.classList.contains("system");
+    const bubble = msg.querySelector(".bubble");
+    if (bubble) {
+      const entry = {
+        role: isUser ? "user" : isAssistant ? "assistant" : "system",
+        content: bubble.innerHTML,
+      };
+      if (isAssistant) {
+        const thinking = msg.querySelector(".thinking-container");
+        if (thinking) {
+          entry.thinking = thinking.outerHTML;
+        }
+      }
+      messages.push(entry);
+    }
+  });
+
+  if (messages.length === 0) return;
+
+  const title = getConversationTitle(messages);
+
+  if (currentConversationId) {
+    const history = getChatHistory();
+    const idx = history.findIndex(h => h.id === currentConversationId);
+    if (idx !== -1) {
+      history[idx].title = title;
+      history[idx].updatedAt = new Date().toISOString();
+      saveChatHistory(history);
+    }
+    saveChatMessages(currentConversationId, messages);
+  }
+}
+
+function getConversationTitle(messages) {
+  const firstUserMsg = messages.find(m => m.role === "user");
+  if (firstUserMsg) {
+    const text = firstUserMsg.content.replace(/<[^>]*>/g, "").trim();
+    return text.length > 30 ? text.slice(0, 30) + "..." : text;
+  }
+  return "新对话";
+}
+
+function getConversationTitleFromChat() {
+  const userMsgs = chatContainer.querySelectorAll(".message.user .bubble");
+  if (userMsgs.length > 0) {
+    const text = userMsgs[0].textContent.trim();
+    return text.length > 30 ? text.slice(0, 30) + "..." : text;
+  }
+  return "新对话";
+}
+
+function startNewConversation() {
+  saveCurrentConversation();
+
+  currentConversationId = generateConvId();
+  SESSION_ID = generateSessionId();
+
+  const history = getChatHistory();
+  history.unshift({
+    id: currentConversationId,
+    session_id: SESSION_ID,
+    title: "新对话",
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  });
+  saveChatHistory(history);
+
+  doClearSession();
+  renderChatHistoryList();
+}
+
+function loadConversation(convId) {
+  if (convId === currentConversationId) return;
+
+  saveCurrentConversation();
+
+  currentConversationId = convId;
+  const history = getChatHistory();
+  const entry = history.find(h => h.id === convId);
+  if (entry && entry.session_id) {
+    SESSION_ID = entry.session_id;
+  }
+
+  const messages = getChatMessages(convId);
+
+  chatContainer.innerHTML = "";
+  if (messages.length === 0) {
+    chatContainer.appendChild(createEmptyState());
+  } else {
+    messages.forEach(msg => {
+      const el = document.createElement("div");
+      el.className = "message " + msg.role;
+      if (msg.role === "user") {
+        el.innerHTML = `<div class="message-role">你</div><div class="bubble">${msg.content}</div>`;
+      } else if (msg.role === "assistant") {
+        let inner = "";
+        if (msg.thinking) {
+          inner += msg.thinking;
+        }
+        inner += `<div class="message-role">📝 结构化报告</div><div class="bubble">${msg.content}</div>`;
+        el.innerHTML = inner;
+      } else {
+        el.innerHTML = `<div class="bubble">${msg.content}</div>`;
+      }
+      chatContainer.appendChild(el);
+    });
+    scrollToBottom();
+  }
+
+  renderChatHistoryList();
+  updateStatus("✅ 已加载历史对话");
+}
+
+function deleteConversation(convId, e) {
+  e.stopPropagation();
+
+  const history = getChatHistory();
+  const filtered = history.filter(h => h.id !== convId);
+  saveChatHistory(filtered);
+  deleteChatMessages(convId);
+
+  if (convId === currentConversationId) {
+    currentConversationId = null;
+    SESSION_ID = generateSessionId();
+    doClearSession();
+    chatContainer.innerHTML = "";
+    chatContainer.appendChild(createEmptyState());
+  }
+
+  renderChatHistoryList();
+}
+
+function renderChatHistoryList() {
+  const list = document.getElementById("chatHistoryList");
+  if (!list) return;
+
+  const history = getChatHistory();
+  if (history.length === 0) {
+    list.innerHTML = '<div class="chat-history-empty">暂无历史对话</div>';
+    return;
+  }
+
+  list.innerHTML = history.map(h => {
+    const isActive = h.id === currentConversationId;
+    const date = new Date(h.updatedAt || h.createdAt);
+    const dateStr = formatDate(date);
+    return `
+      <div class="chat-history-item ${isActive ? "active" : ""}"
+           onclick="loadConversation('${h.id}')">
+        <div class="chat-history-item-title" title="${escapeHtml(h.title)}">${escapeHtml(h.title)}</div>
+        <div class="chat-history-item-date">${dateStr}</div>
+        <div class="chat-history-item-delete" onclick="deleteConversation('${h.id}', event)">🗑</div>
+      </div>
+    `;
+  }).join("");
+}
+
+function formatDate(date) {
+  const now = new Date();
+  const diff = now - date;
+  if (diff < 60000) return "刚刚";
+  if (diff < 3600000) return Math.floor(diff / 60000) + "分钟前";
+  if (diff < 86400000) return Math.floor(diff / 3600000) + "小时前";
+  const month = date.getMonth() + 1;
+  const day = date.getDate();
+  return month + "/" + day;
+}
+
+// 初始化：加载历史列表
+function initChatHistory() {
+  currentConversationId = null;
+  SESSION_ID = generateSessionId();
+  renderChatHistoryList();
+}
+
+// 监听清空会话按钮，同时保存当前对话
+const originalClearHandler = btnClear.onclick;
+btnClear.addEventListener("click", () => {
+  saveCurrentConversation();
+  currentConversationId = null;
+  SESSION_ID = generateSessionId();
+  renderChatHistoryList();
+});
+
+// 新对话按钮
+document.getElementById("btnNewChat").addEventListener("click", startNewConversation);
+
+// 页面加载时初始化
+initChatHistory();
 
 // ==================== 配置管理 ====================
 

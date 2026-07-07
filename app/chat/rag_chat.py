@@ -20,6 +20,8 @@ from typing import Optional, Callable, Any
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from prompt import load_prompt
+
 import requests
 from dotenv import load_dotenv
 from pymilvus import MilvusClient
@@ -60,7 +62,6 @@ CHAT_URL = os.environ.get("CHAT_URL", "http://14.22.86.97:11001/v1/chat/completi
 CHAT_MODEL = os.environ.get("CHAT_MODEL", "qwen36-27b")
 DB_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data_pipeline", "milvus_lite.db")
 COLLECTION_NAME = "report_slices"
-PROMPT_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "rag", "prompt.md")
 
 MAX_STEPS = 5
 RAG_TOP_K = 5
@@ -100,10 +101,7 @@ def parse_react_output(text: str):
 
 
 def load_system_prompt():
-    if os.path.exists(PROMPT_FILE):
-        with open(PROMPT_FILE, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    return "你是一个医疗影像报告分析助手。请根据检索到的参考信息回答用户问题。如果参考信息不足以回答问题，请如实说明。"
+    return load_prompt("report_generation")
 
 
 @retry()
@@ -250,73 +248,8 @@ def summarize_fn(messages: list[dict]) -> str:
         return ""
 
 
-REACT_SYSTEM_PROMPT = """你是一个具备多步推理能力的 AI 助手，你有访问报告数据库的检索工具。
-
-## 输出格式
-
-每轮你必须输出以下三种格式之一：
-
-### 继续推理
-```
-[CONTINUE]
-你对当前问题的推理分析（可以是一段话，也可以是多点分析）
-```
-
-### 调用检索
-```
-[ACTION: search]
-检索查询词（简洁的搜索关键词）
-```
-
-### 最终回答
-```
-[FINAL]
-你的最终回答（Markdown 格式，基于检索结果和推理给出准确回答）
-```
-
-## 工作方式
-
-1. 收到问题后，先判断是否需要检索：
-   - 需要检索 → 输出 [ACTION: search] 进行检索
-   - 不需要检索 → 输出 [CONTINUE] 进行推理
-2. 检索结果会以"观察"形式返回给你
-3. 综合分析检索结果和推理，判断是否需要继续：
-   - 信息不足 → 继续 [ACTION: search] 或 [CONTINUE]
-   - 信息充分 → 输出 [FINAL] 给出最终回答
-
-## 修改/编辑场景（重要）
-
-当用户要求修改、调整、变更、替换之前生成的内容时，**绝对不要检索**：
-- 用户说的是"修改CT值为70"、"把诊断改成XX"、"调整一下格式"等 → 这是编辑请求
-- 编辑请求不需要检索知识库，知识库里没有用户想要的具体数值
-- 直接基于对话历史中的上一轮报告，找到要修改的部分，用 [CONTINUE] 推理修改方案，然后 [FINAL] 输出修改后的完整报告
-- 修改时只改变用户指定的内容，其余部分保持原样
-
-## 多病变追加规则
-
-当用户输入的是与上一轮不同的新病变时，需要将新旧病变合并到同一份报告中：
-- 检索新病变的信息
-- 将新病变的「影像学表现」追加到上一轮报告的对应模块中，两个病变之间空一行分隔
-- 将新病变的「诊断意见」追加到上一轮报告的对应模块中，用分号分隔
-- 如果用户输入的是修改请求（见上条规则），则不要追加，只修改
-
-## 重要规则
-
-- 第一轮不要直接输出 [FINAL]，至少先检索或推理一步
-- 检索时使用简洁的关键词，不要用完整句子
-- [FINAL] 回答要基于检索结果，注明信息来源（如"参考1显示..."）
-- 如果检索结果不足以回答问题，如实说明"""
-
-MULTI_DISEASE_PROMPT = """
-## 多病变合并输出规则
-
-当收到多份不同病变的检索结果时，需要将所有病变合并到同一份报告中：
-
-1. 「影像学表现」模块：按病变顺序依次描述每个病变，每个病变之间空一行分隔，可在每个病变前标注病变名称（如"CT脑出血："）
-2. 「诊断意见」模块：按病变顺序依次列出每个病变的诊断意见，用分号分隔
-3. 每个病变的书写规则与单病变规则一致（忠实原文、分行排版、病灶独立拆分等）
-4. 输出格式仍为 Markdown，仅包含「一、影像学表现」和「二、诊断意见」两个模块，不得出现多个独立的影像学表现或诊断意见模块
-"""
+REACT_SYSTEM_PROMPT = load_prompt("react_system")
+MULTI_DISEASE_PROMPT = load_prompt("multi_disease")
 
 
 @retry()

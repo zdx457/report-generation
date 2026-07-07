@@ -30,6 +30,7 @@ import re
 
 import requests
 from config import get_rewrite_base_url, get_rewrite_model, get_rewrite_api_key, get_metadata_path
+from prompt import load_prompt
 
 CHAT_URL = get_rewrite_base_url()
 CHAT_MODEL = get_rewrite_model()
@@ -199,28 +200,7 @@ def get_clarification(query):
     return "请补充检查部位或诊断信息，例如：CT头颅、MR膝关节等。"
 
 
-REWRITE_SYSTEM_PROMPT = """你是一个医疗影像报告检索系统的查询改写助手。
-
-任务：根据数据库元数据，将用户简短的查询扩展为更具体的检索描述。
-
-规则：
-1. 保留用户原始的检查类型和部位，使用标准术语
-2. 只补充与该检查类型/部位相关的检查项目和诊断结论关键词
-3. 只使用以下元数据中存在的术语，不要编造
-4. 输出格式：直接输出扩展后的查询文本，不要解释
-5. 扩展后长度控制在 10-30 字
-
-数据库元数据：
-- 检查类型：{check_types}
-- 部位：{parts}
-- 检查项目：{projects}
-- 诊断结论：{diagnoses}
-
-示例：
-- 输入: "CT头颅" → 输出: "CT头颅 颅脑平扫 颅脑平扫+增强"
-- 输入: "MR膝关节" → 输出: "MR膝关节 半月板 韧带"
-- 输入: "CT胸部" → 输出: "CT胸部 胸部平扫 胸部平扫+增强"
-- 输入: "CT脑出血" → 输出: "CT脑出血 破入脑室 颅脑平扫\""""
+REWRITE_SYSTEM_PROMPT = load_prompt("rewrite")
 
 
 def _build_rewrite_prompt(keywords=None):

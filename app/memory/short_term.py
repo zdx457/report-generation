@@ -20,6 +20,8 @@ from typing import Callable
 
 logger = logging.getLogger(__name__)
 
+from prompt import load_prompt
+
 REFERENCE_PATTERNS = [
     "那个", "刚才", "上面", "之前", "上文", "前文",
     "刚刚", "那个病", "那个检查", "那次",
@@ -38,11 +40,7 @@ MODALITY_PATTERNS = [
 
 DECAY_FACTOR = 0.9
 
-SUMMARIZE_PROMPT = (
-    "请将以下对话轮次压缩为一句简洁的摘要（不超过50字），"
-    "保留关键实体、核心结论、数值信息，忽略寒暄和无关内容。"
-    "只输出摘要句，不要加任何前缀或解释。"
-)
+SUMMARIZE_PROMPT = load_prompt("summarize")
 
 
 class ShortTermMemory:

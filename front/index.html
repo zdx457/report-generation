@@ -35,57 +35,77 @@
       <div class="main">
         <!-- Agent 页面 -->
         <div class="page active" id="pageAgent">
-          <header class="header">
-            <h1>影像报告生成Agent</h1>
-          </header>
+          <div class="agent-layout">
+            <!-- 历史对话侧边栏 -->
+            <aside class="chat-history-sidebar" id="chatHistorySidebar">
+              <div class="new-chat-btn-container">
+                <button id="btnNewChat" class="btn btn-primary new-chat-btn">
+                  <span>开启新对话</span>
+                </button>
+              </div>
+              <div class="chat-history-title">历史对话</div>
+              <div class="chat-history-list" id="chatHistoryList">
+                <div class="chat-history-empty">暂无历史对话</div>
+              </div>
+            </aside>
 
-          <div class="toolbar">
-            <button id="btnClear" class="btn btn-outline">清空会话</button>
-            <button id="btnMemory" class="btn btn-outline">短期记忆</button>
-            <button
-              id="btnConfigModel"
-              class="btn btn-outline"
-              title="配置模型"
-            >
-              ⚙️ 配置模型
-            </button>
-          </div>
+            <!-- 聊天主区域 -->
+            <div class="agent-main">
+              <header class="header">
+                <h1>影像报告生成Agent</h1>
+              </header>
 
-          <div class="memory-panel" id="memoryPanel" style="display: none">
-            <div class="memory-panel-header">
-              <h3>短期记忆详情</h3>
-              <button class="memory-panel-close" id="btnMemoryClose">✕</button>
+              <div class="toolbar">
+                <button id="btnClear" class="btn btn-outline">清空会话</button>
+                <button id="btnMemory" class="btn btn-outline">短期记忆</button>
+                <button
+                  id="btnConfigModel"
+                  class="btn btn-outline"
+                  title="配置模型"
+                >
+                  ⚙️ 配置模型
+                </button>
+              </div>
+
+              <div class="memory-panel" id="memoryPanel" style="display: none">
+                <div class="memory-panel-header">
+                  <h3>短期记忆详情</h3>
+                  <button class="memory-panel-close" id="btnMemoryClose">
+                    ✕
+                  </button>
+                </div>
+                <div class="memory-panel-body" id="memoryPanelBody">
+                  <div class="memory-loading">加载中...</div>
+                </div>
+              </div>
+
+              <div class="chat-container" id="chatContainer">
+                <div class="empty-state">
+                  <div class="empty-icon">📋</div>
+                  <p>输入CT/MRI等检查关键词，生成结构化影像报告</p>
+                  <p class="hint">例如：CT脑出血、MRI膝关节、脑梗</p>
+                </div>
+              </div>
+
+              <div class="input-area">
+                <textarea
+                  id="userInput"
+                  placeholder="输入检查关键词，如：CT脑出血、脑梗..."
+                  rows="2"
+                  autofocus
+                ></textarea>
+                <button id="btnSend" class="btn btn-primary">
+                  <span class="btn-text">发送</span>
+                  <span class="btn-loading" style="display: none"
+                    >⏳ 生成中...</span
+                  >
+                </button>
+              </div>
+
+              <div class="status-bar" id="statusBar">
+                <span id="statusText">就绪</span>
+              </div>
             </div>
-            <div class="memory-panel-body" id="memoryPanelBody">
-              <div class="memory-loading">加载中...</div>
-            </div>
-          </div>
-
-          <div class="chat-container" id="chatContainer">
-            <div class="empty-state">
-              <div class="empty-icon">📋</div>
-              <p>输入CT/MRI等检查关键词，生成结构化影像报告</p>
-              <p class="hint">例如：CT脑出血、MRI膝关节、脑梗</p>
-            </div>
-          </div>
-
-          <div class="input-area">
-            <textarea
-              id="userInput"
-              placeholder="输入检查关键词，如：CT脑出血、脑梗..."
-              rows="2"
-              autofocus
-            ></textarea>
-            <button id="btnSend" class="btn btn-primary">
-              <span class="btn-text">发送</span>
-              <span class="btn-loading" style="display: none"
-                >⏳ 生成中...</span
-              >
-            </button>
-          </div>
-
-          <div class="status-bar" id="statusBar">
-            <span id="statusText">就绪</span>
           </div>
         </div>
 
