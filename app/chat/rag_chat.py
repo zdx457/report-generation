@@ -493,7 +493,7 @@ def web_main(port=8000):
         print("向量数据库不存在，请先运行 build_vector_db.py", file=sys.stderr)
         sys.exit(1)
 
-    app = FastAPI(title="影像报告生成系统")
+    app = FastAPI(title="影像报告生成Agent")
 
     front_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "front")
     if os.path.isdir(front_dir):
@@ -504,7 +504,7 @@ def web_main(port=8000):
         index_path = os.path.join(front_dir, "index.html")
         if os.path.exists(index_path):
             return FileResponse(index_path)
-        return {"message": "影像报告生成系统 API", "docs": "/docs"}
+        return {"message": "影像报告生成Agent API", "docs": "/docs"}
 
     def _get_or_create_session(session_id):
         if session_id not in _web_sessions:
@@ -617,7 +617,7 @@ def web_main(port=8000):
         }
 
     print(f"\n{'='*60}")
-    print(f"  影像报告生成系统 Web 服务")
+    print(f"  影像报告生成Agent Web 服务")
     print(f"  {'='*60}")
     print(f"  地址: http://localhost:{port}")
     print(f"  API 文档: http://localhost:{port}/docs")

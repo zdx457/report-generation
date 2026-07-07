@@ -186,14 +186,22 @@ const pages = document.querySelectorAll(".page");
 
 sidebarBtns.forEach(btn => {
   btn.addEventListener("click", () => {
+    // 关闭弹窗
+    const panel = document.getElementById("llmConfigPanel");
+    if (panel) panel.style.display = "none";
+
     const page = btn.dataset.page;
     sidebarBtns.forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
     pages.forEach(p => p.classList.remove("active"));
-    const target = document.getElementById(page === "agent" ? "pageAgent" : "pageKB");
+    const pageMap = { agent: "pageAgent", kb: "pageKB", config: "pageConfig" };
+    const target = document.getElementById(pageMap[page] || "pageAgent");
     if (target) target.classList.add("active");
     if (page === "kb") {
       refreshKBStatus();
+    }
+    if (page === "config") {
+      loadConfig();
     }
   });
 });
@@ -937,12 +945,518 @@ function finishThinking(container) {
   container.classList.add("thinking-collapsed", "thinking-done");
 }
 
+// ==================== 配置管理 ====================
+
+// 模型列表配置：每个模型类型有哪些字段
+const MODEL_DEFS = {
+  llms: {
+    listId: "modelListLlms",
+    btnAddId: "btnAddLlm",
+    fields: [
+      { key: "name", label: "名称", type: "text", placeholder: "标识名称", sm: false },
+      { key: "base_url", label: "API 地址", type: "text", placeholder: "http://...", sm: false },
+      { key: "model", label: "模型名", type: "text", placeholder: "qwen36_27b", sm: false },
+      { key: "api_key", label: "API Key", type: "password", placeholder: "可选", sm: false },
+      { key: "max_tokens", label: "最大 Token", type: "number", sm: true },
+      { key: "temperature", label: "温度", type: "number", step: "0.1", sm: true },
+    ],
+  },
+  embeddings: {
+    listId: "modelListEmbeddings",
+    btnAddId: "btnAddEmbedding",
+    fields: [
+      { key: "name", label: "名称", type: "text", placeholder: "标识名称", sm: false },
+      { key: "base_url", label: "API 地址", type: "text", placeholder: "http://...", sm: false },
+      { key: "model", label: "模型名", type: "text", placeholder: "bge-m3", sm: false },
+      { key: "api_key", label: "API Key", type: "password", placeholder: "可选", sm: false },
+      { key: "dimension", label: "维度", type: "number", sm: true },
+    ],
+  },
+  reranks: {
+    listId: "modelListReranks",
+    btnAddId: "btnAddRerank",
+    fields: [
+      { key: "name", label: "名称", type: "text", placeholder: "标识名称", sm: false },
+      { key: "base_url", label: "API 地址", type: "text", placeholder: "https://...", sm: false },
+      { key: "model", label: "模型名", type: "text", placeholder: "Qwen/Qwen3-VL-Reranker-8B", sm: false },
+      { key: "api_key", label: "API Key", type: "password", placeholder: "可选", sm: false },
+    ],
+  },
+};
+
+// 非模型列表的简单字段映射
+const SIMPLE_FIELDS = {
+  "retrieval.rag_top_k": "cfg_retrieval_rag_top_k",
+  "retrieval.rerank_top_k": "cfg_retrieval_rerank_top_k",
+  "retrieval.collection_name": "cfg_retrieval_collection_name",
+  "retrieval.db_path": "cfg_retrieval_db_path",
+  "short_term_memory.max_rounds": "cfg_stm_max_rounds",
+  "short_term_memory.decay_factor": "cfg_stm_decay_factor",
+};
+
+// 渲染一个模型列表
+function renderModelList(sectionKey) {
+  const def = MODEL_DEFS[sectionKey];
+  const container = document.getElementById(def.listId);
+  if (!container) return;
+  container.innerHTML = "";
+  const items = _configData[sectionKey] || [];
+  items.forEach((item, idx) => {
+    const card = document.createElement("div");
+    card.className = "model-card";
+    card.dataset.index = idx;
+    card.dataset.section = sectionKey;
+
+    card.innerHTML = `
+      <div class="model-card-header">
+        <div class="model-card-title">${escapeHtml(item.name || `模型 ${idx + 1}`)}</div>
+        <div class="model-card-actions">
+          <span class="model-status model-status-clickable" title="点击测试 API 连通性">验证</span>
+          <button type="button" class="btn btn-xs btn-danger model-remove-btn" title="删除此模型">✕</button>
+        </div>
+      </div>
+      <div class="model-card-body">
+        ${def.fields.map(f => {
+          const val = item[f.key] !== undefined ? item[f.key] : "";
+          return `
+            <div class="model-field">
+              <label class="model-field-label">${f.label}</label>
+              <input type="${f.type}" ${f.step ? `step="${f.step}"` : ""}
+                class="config-input ${f.sm ? "config-input-sm" : ""}"
+                data-field="${f.key}" value="${escapeHtml(String(val))}"
+                placeholder="${f.placeholder || ""}">
+            </div>`;
+        }).join("")}
+      </div>
+      <div class="model-card-error" style="display: none"></div>
+    `;
+    container.appendChild(card);
+  });
+
+  // 绑定状态点击（点击重新测试）
+  container.querySelectorAll(".model-status").forEach(statusEl => {
+    statusEl.addEventListener("click", async (e) => {
+      const card = e.target.closest(".model-card");
+      if (!card) return;
+      await testModelConnection(sectionKey, card);
+    });
+  });
+
+  // 绑定删除按钮
+  container.querySelectorAll(".model-remove-btn").forEach(btn => {
+    btn.addEventListener("click", (e) => {
+      const card = e.target.closest(".model-card");
+      if (!card) return;
+      card.remove();
+      reindexModelCards(sectionKey);
+    });
+  });
+}
+
+function reindexModelCards(sectionKey) {
+  const def = MODEL_DEFS[sectionKey];
+  const container = document.getElementById(def.listId);
+  if (!container) return;
+  const cards = container.querySelectorAll(".model-card");
+  cards.forEach((card, idx) => {
+    card.dataset.index = idx;
+  });
+}
+
+function addModelItem(sectionKey) {
+  const def = MODEL_DEFS[sectionKey];
+  const newItem = {};
+  def.fields.forEach(f => { newItem[f.key] = ""; });
+  newItem.name = "new";
+  if (!_configData[sectionKey]) _configData[sectionKey] = [];
+  _configData[sectionKey].push(newItem);
+  renderModelList(sectionKey);
+}
+
+// 收集模型列表数据
+function collectModelData(sectionKey) {
+  const def = MODEL_DEFS[sectionKey];
+  const container = document.getElementById(def.listId);
+  if (!container) return [];
+  const cards = container.querySelectorAll(".model-card");
+  const items = [];
+  cards.forEach((card, idx) => {
+    const item = {};
+    def.fields.forEach(f => {
+      const input = card.querySelector(`[data-field="${f.key}"]`);
+      if (!input) return;
+      let val = input.value.trim();
+      if (input.type === "number" || input.step) {
+        val = val === "" ? "" : Number(val);
+        if (input.step === "0.1" && val !== "") val = parseFloat(val);
+      }
+      if (val !== "" || input.type === "password") {
+        item[f.key] = val;
+      }
+    });
+    items.push(item);
+  });
+  return items;
+}
+
+// 测试模型 API 连接
+async function testModelConnection(sectionKey, card) {
+  const def = MODEL_DEFS[sectionKey];
+  const model = {};
+  def.fields.forEach(f => {
+    const input = card.querySelector(`[data-field="${f.key}"]`);
+    if (!input) return;
+    let val = input.value.trim();
+    if (input.type === "number" || input.step) {
+      val = val === "" ? "" : Number(val);
+      if (input.step === "0.1" && val !== "") val = parseFloat(val);
+    }
+    if (val !== "" || input.type === "password") {
+      model[f.key] = val;
+    }
+  });
+
+  const errorEl = card.querySelector(".model-card-error");
+  errorEl.style.display = "none";
+  errorEl.textContent = "";
+
+  if (!model.base_url) {
+    errorEl.textContent = "❌ API 地址不能为空";
+    errorEl.style.display = "block";
+    return;
+  }
+  if (!model.model) {
+    errorEl.textContent = "❌ 模型名不能为空";
+    errorEl.style.display = "block";
+    return;
+  }
+
+  const statusEl = card.querySelector(".model-status");
+  statusEl.textContent = "验证中";
+  statusEl.className = "model-status model-status-clickable model-status-verifying";
+
+  try {
+    const resp = await fetch(`${API_BASE}/test-model`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model_config: model, model_type: sectionKey }),
+    });
+    const data = await resp.json();
+    if (data.success) {
+      statusEl.textContent = "✅可用";
+      statusEl.className = "model-status model-status-clickable model-status-ok";
+      errorEl.style.display = "none";
+      errorEl.textContent = "";
+    } else {
+      statusEl.textContent = "❌不可用";
+      statusEl.className = "model-status model-status-clickable model-status-fail";
+      const modelName = model.name || '未命名';
+      const errorMsg = data.error || data.message || '未知错误';
+      console.error(`[模型验证] ${sectionKey} - ${modelName} 验证失败:`, errorMsg);
+      errorEl.textContent = `❌ 验证失败: ${errorMsg}`;
+      errorEl.style.display = "block";
+    }
+  } catch (e) {
+    statusEl.textContent = "❌不可用";
+    statusEl.className = "model-status model-status-clickable model-status-fail";
+    const modelName = model.name || '未命名';
+    console.error(`[模型验证] ${sectionKey} - ${modelName} 验证失败:`, e);
+    errorEl.textContent = `❌ 验证失败: ${e.message}`;
+    errorEl.style.display = "block";
+  }
+}
+
+// 自动验证所有模型
+async function testAllModels() {
+  for (const sectionKey of Object.keys(MODEL_DEFS)) {
+    const def = MODEL_DEFS[sectionKey];
+    const container = document.getElementById(def.listId);
+    if (!container) continue;
+    const cards = container.querySelectorAll(".model-card");
+    for (const card of cards) {
+      await testModelConnection(sectionKey, card);
+    }
+  }
+}
+
+// 加载配置
+let _configData = {};
+
+async function loadConfig() {
+  try {
+    const resp = await fetch(`${API_BASE}/config?t=${Date.now()}`);
+    const data = await resp.json();
+    if (data.error) {
+      showConfigHint("❌ " + data.error);
+      return;
+    }
+    _configData = data.config || {};
+
+    // 渲染模型列表
+    Object.keys(MODEL_DEFS).forEach(sectionKey => {
+      renderModelList(sectionKey);
+    });
+
+    // 填充简单字段
+    for (const [key, elId] of Object.entries(SIMPLE_FIELDS)) {
+      const el = document.getElementById(elId);
+      if (!el) continue;
+      const keys = key.split(".");
+      let val = _configData;
+      for (const k of keys) {
+        if (val && typeof val === "object") val = val[k];
+        else { val = undefined; break; }
+      }
+      if (val !== undefined && val !== null) {
+        el.value = val;
+      }
+    }
+    showConfigHint("✅ 配置已加载");
+    // 刷新 Agent 页面的模型下拉框
+    refreshModelSelect();
+    // 自动验证所有模型
+    testAllModels();
+  } catch (e) {
+    console.error("[Config] 加载配置失败:", e);
+    showConfigHint("❌ 加载配置失败: " + e.message);
+  }
+}
+
+function showConfigHint(msg) {
+  const hint = document.getElementById("configHint");
+  if (hint) hint.textContent = msg;
+}
+
+// 保存配置
+async function saveConfig() {
+  const btn = document.getElementById("btnSaveConfig");
+  btn.disabled = true;
+  btn.textContent = "⏳ 保存中...";
+  try {
+    const cfg = {};
+
+    // 收集模型列表
+    Object.keys(MODEL_DEFS).forEach(sectionKey => {
+      cfg[sectionKey] = collectModelData(sectionKey);
+    });
+
+    // 收集简单字段
+    for (const [key, elId] of Object.entries(SIMPLE_FIELDS)) {
+      const el = document.getElementById(elId);
+      if (!el) continue;
+      const keys = key.split(".");
+      let node = cfg;
+      for (let i = 0; i < keys.length - 1; i++) {
+        if (!node[keys[i]]) node[keys[i]] = {};
+        node = node[keys[i]];
+      }
+      const lastKey = keys[keys.length - 1];
+      let val = el.value.trim();
+      if (el.type === "number" || el.step) {
+        val = val === "" ? "" : Number(val);
+        if (el.step === "0.1" && val !== "") val = parseFloat(val);
+      }
+      if (val !== "") {
+        node[lastKey] = val;
+      }
+    }
+
+    // 保留 active_models
+    if (_configData.active_models) {
+      cfg.active_models = _configData.active_models;
+    }
+
+    const resp = await fetch(`${API_BASE}/config`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ config: cfg }),
+    });
+    const data = await resp.json();
+    if (data.status === "ok") {
+      showConfigHint("✅ " + data.message);
+    } else {
+      showConfigHint("❌ " + (data.error || "保存失败"));
+    }
+  } catch (e) {
+    console.error("[Config] 保存配置失败:", e);
+    showConfigHint("❌ 保存失败: " + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "💾 保存配置";
+  }
+}
+
+// 当前选中的 LLM 名称
+let _currentLlmName = "";
+
+// 刷新当前激活的 LLM 名称
+function refreshModelSelect() {
+  const llms = _configData.llms || [];
+  const activeModels = _configData.active_models || {};
+  const savedName = activeModels.chat_llm || "";
+  if (savedName && llms.some(m => m.name === savedName)) {
+    _currentLlmName = savedName;
+  } else if (llms.length > 0) {
+    _currentLlmName = llms[0].name || "";
+  }
+}
+// 打开模型选择弹窗
+function openLlmConfigPanel() {
+  const panel = document.getElementById("llmConfigPanel");
+  if (!panel) return;
+  panel.style.display = "flex";
+
+  const activeModels = _configData.active_models || {};
+
+  // 填充 LLM 下拉框
+  const llmSelect = document.getElementById("activeChatLlm");
+  const llms = _configData.llms || [];
+  llmSelect.innerHTML = llms.map((m, i) =>
+    `<option value="${i}" ${m.name === activeModels.chat_llm ? "selected" : ""}>${escapeHtml(m.name || `模型 ${i + 1}`)}</option>`
+  ).join("");
+
+  // 填充 Embedding 下拉框
+  const embSelect = document.getElementById("activeEmbedding");
+  const embeddings = _configData.embeddings || [];
+  embSelect.innerHTML = embeddings.map((m, i) =>
+    `<option value="${i}" ${m.name === activeModels.embedding ? "selected" : ""}>${escapeHtml(m.name || `模型 ${i + 1}`)}</option>`
+  ).join("");
+
+  // 填充 Rerank 下拉框
+  const rerankSelect = document.getElementById("activeRerank");
+  const reranks = _configData.reranks || [];
+  rerankSelect.innerHTML = reranks.map((m, i) =>
+    `<option value="${i}" ${m.name === activeModels.rerank ? "selected" : ""}>${escapeHtml(m.name || `模型 ${i + 1}`)}</option>`
+  ).join("");
+
+  document.getElementById("llmConfigHint").textContent = "";
+}
+
+// 弹窗保存激活模型
+async function saveLlmConfigFromPanel() {
+  const hint = document.getElementById("llmConfigHint");
+  const llms = _configData.llms || [];
+  const embeddings = _configData.embeddings || [];
+  const reranks = _configData.reranks || [];
+
+  const llmIdx = parseInt(document.getElementById("activeChatLlm").value);
+  const embIdx = parseInt(document.getElementById("activeEmbedding").value);
+  const rerankIdx = parseInt(document.getElementById("activeRerank").value);
+
+  const chatLlm = llms[llmIdx];
+  const embedding = embeddings[embIdx];
+  const rerank = reranks[rerankIdx];
+
+  if (!chatLlm || !chatLlm.name) { hint.textContent = "❌ 请选择对话大语言模型"; return; }
+  if (!embedding || !embedding.name) { hint.textContent = "❌ 请选择向量化模型"; return; }
+  if (!rerank || !rerank.name) { hint.textContent = "❌ 请选择重排模型"; return; }
+
+  if (!_configData.active_models) _configData.active_models = {};
+  _configData.active_models.chat_llm = chatLlm.name;
+  _configData.active_models.embedding = embedding.name;
+  _configData.active_models.rerank = rerank.name;
+  _currentLlmName = chatLlm.name;
+
+  const btn = document.getElementById("btnSaveLlmConfig");
+  btn.disabled = true;
+  btn.textContent = "⏳ 保存中...";
+
+  try {
+    const cfg = { ..._configData };
+    cfg.active_models = _configData.active_models;
+
+    const resp = await fetch(`${API_BASE}/config`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ config: cfg }),
+    });
+    const data = await resp.json();
+    if (data.status === "ok") {
+      hint.textContent = "✅ " + data.message;
+      // 保存后关闭弹窗
+      setTimeout(() => {
+        document.getElementById("llmConfigPanel").style.display = "none";
+      }, 800);
+    } else {
+      hint.textContent = "❌ " + (data.error || "保存失败");
+    }
+  } catch (e) {
+    hint.textContent = "❌ 保存失败: " + e.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "保存";
+  }
+}
+
+  document.addEventListener("DOMContentLoaded", () => {
+  const btnSaveConfig = document.getElementById("btnSaveConfig");
+  if (btnSaveConfig) {
+    btnSaveConfig.addEventListener("click", saveConfig);
+  }
+  // 绑定各模型列表的添加按钮
+  Object.values(MODEL_DEFS).forEach(def => {
+    const btn = document.getElementById(def.btnAddId);
+    if (btn) {
+      const sectionKey = Object.keys(MODEL_DEFS).find(k => MODEL_DEFS[k] === def);
+      btn.addEventListener("click", () => addModelItem(sectionKey));
+    }
+  });
+  // 绑定配置模型按钮 - 打开弹窗
+  const btnConfigModel = document.getElementById("btnConfigModel");
+  if (btnConfigModel) {
+    btnConfigModel.addEventListener("click", () => {
+      openLlmConfigPanel();
+    });
+  }
+  // 绑定弹窗关闭
+  const btnLlmConfigClose = document.getElementById("btnLlmConfigClose");
+  if (btnLlmConfigClose) {
+    btnLlmConfigClose.addEventListener("click", () => {
+      document.getElementById("llmConfigPanel").style.display = "none";
+    });
+  }
+  // 绑定弹窗保存按钮
+  const btnSaveLlmConfig = document.getElementById("btnSaveLlmConfig");
+  if (btnSaveLlmConfig) {
+    btnSaveLlmConfig.addEventListener("click", () => {
+      saveLlmConfigFromPanel();
+    });
+  }
+  // 绑定配置导航切换
+  const navItems = document.querySelectorAll(".config-nav-item");
+  navItems.forEach(item => {
+    item.addEventListener("click", () => {
+      const targetKey = item.dataset.config;
+      navItems.forEach(i => i.classList.remove("active"));
+      document.querySelectorAll(".config-group").forEach(g => g.style.display = "none");
+      item.classList.add("active");
+      const targetGroup = document.getElementById(`configGroup${targetKey.charAt(0).toUpperCase() + targetKey.slice(1)}`);
+      if (targetGroup) {
+        targetGroup.style.display = "block";
+      }
+    });
+  });
+  // 页面加载后立即加载配置，确保 Agent 页面打开时模型下拉框就有内容
+  loadConfig();
+});
+
 function addAssistantMessage(content) {
   const msg = document.createElement("div");
   msg.className = "message assistant";
   msg.innerHTML = `
     <div class="message-role">💬 助手</div>
-    <div class="bubble">${escapeHtml(content).replace(/\n/g, "<br>")}</div>
+    <div class="bubble">${renderMarkdown(content)}</div>
+  `;
+  chatContainer.appendChild(msg);
+  scrollToBottom();
+}
+
+function addUserMessage(text) {
+  const msg = document.createElement("div");
+  msg.className = "message user";
+  msg.innerHTML = `
+    <div class="message-role">👤 用户</div>
+    <div class="bubble">${escapeHtml(text)}</div>
   `;
   chatContainer.appendChild(msg);
   scrollToBottom();

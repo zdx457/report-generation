@@ -16,6 +16,11 @@ def _load():
     else:
         _config = {}
 
+def reload_config():
+    global _config
+    _config = {}
+    _load()
+
 def _resolve(path: str, default=None):
     _load()
     keys = path.split(".")
@@ -29,46 +34,113 @@ def _resolve(path: str, default=None):
             return default
     return node
 
+def _get_active(section_key: str) -> dict:
+    """获取模型列表中的激活项，兼容旧格式。
+    
+    新格式: llms / embeddings / reranks (数组，取 active_models 指定或 active=true 的)
+    旧格式: llm / embedding / rerank (单个 dict)
+    """
+    _load()
+    items = _config.get(section_key)
+    if items is None:
+        return {}
+    if isinstance(items, list):
+        # 优先使用 active_models 中指定的模型
+        active_models = _config.get("active_models", {})
+        # 映射: llms -> chat_llm, embeddings -> embedding, reranks -> rerank
+        active_name_map = {"llms": "chat_llm", "embeddings": "embedding", "reranks": "rerank"}
+        active_name = active_models.get(active_name_map.get(section_key, ""))
+        if active_name:
+            for item in items:
+                if item.get("name") == active_name:
+                    return item
+        # 其次使用 active: true 的模型
+        for item in items:
+            if item.get("active"):
+                return item
+        if items:
+            return items[0]
+        return {}
+    if isinstance(items, dict):
+        return items
+    return {}
+
+
+def _get_active_rewrite() -> dict:
+    """获取问答改写模型，从统一的 llms 列表中查找。
+    
+    优先 active_models.rewrite_llm 指定名称，其次 active: true。
+    """
+    _load()
+    items = _config.get("llms")
+    if items is None:
+        return {}
+    if isinstance(items, list):
+        active_models = _config.get("active_models", {})
+        rewrite_name = active_models.get("rewrite_llm")
+        if rewrite_name:
+            for item in items:
+                if item.get("name") == rewrite_name:
+                    return item
+        for item in items:
+            if item.get("active"):
+                return item
+        if items:
+            return items[0]
+        return {}
+    if isinstance(items, dict):
+        return items
+    return {}
+
 
 # ============================================================
 # 便捷访问函数
 # ============================================================
 
 def get_llm_base_url() -> str:
-    return os.environ.get("CHAT_URL", _resolve("llm.base_url", ""))
+    return os.environ.get("CHAT_URL", _get_active("llms").get("base_url", ""))
 
 def get_llm_model() -> str:
-    return os.environ.get("CHAT_MODEL", _resolve("llm.model", ""))
+    return os.environ.get("CHAT_MODEL", _get_active("llms").get("model", ""))
+
+def get_llm_api_key() -> str:
+    return os.environ.get("CHAT_API_KEY", _get_active("llms").get("api_key", ""))
 
 def get_llm_max_tokens() -> int:
-    return _resolve("llm.max_tokens", 2048)
+    return _get_active("llms").get("max_tokens", 2048)
 
 def get_llm_temperature() -> float:
-    return _resolve("llm.temperature", 0.3)
+    return _get_active("llms").get("temperature", 0.3)
 
 def get_rewrite_base_url() -> str:
-    return os.environ.get("REWRITE_URL", _resolve("llm_rewrite.base_url", get_llm_base_url()))
+    return os.environ.get("REWRITE_URL", _get_active_rewrite().get("base_url", get_llm_base_url()))
 
 def get_rewrite_model() -> str:
-    return os.environ.get("REWRITE_MODEL", _resolve("llm_rewrite.model", get_llm_model()))
+    return os.environ.get("REWRITE_MODEL", _get_active_rewrite().get("model", get_llm_model()))
+
+def get_rewrite_api_key() -> str:
+    return os.environ.get("REWRITE_API_KEY", _get_active_rewrite().get("api_key", get_llm_api_key()))
 
 def get_embed_base_url() -> str:
-    return os.environ.get("EMBED_URL", _resolve("embedding.base_url", ""))
+    return os.environ.get("EMBED_URL", _get_active("embeddings").get("base_url", ""))
 
 def get_embed_model() -> str:
-    return os.environ.get("EMBED_MODEL", _resolve("embedding.model", ""))
+    return os.environ.get("EMBED_MODEL", _get_active("embeddings").get("model", ""))
+
+def get_embed_api_key() -> str:
+    return os.environ.get("EMBED_API_KEY", _get_active("embeddings").get("api_key", ""))
 
 def get_embed_dimension() -> int:
-    return _resolve("embedding.dimension", 1024)
+    return _get_active("embeddings").get("dimension", 1024)
 
 def get_rerank_base_url() -> str:
-    return os.environ.get("RERANK_URL", _resolve("rerank.base_url", ""))
+    return os.environ.get("RERANK_URL", _get_active("reranks").get("base_url", ""))
 
 def get_rerank_model() -> str:
-    return os.environ.get("RERANK_MODEL", _resolve("rerank.model", ""))
+    return os.environ.get("RERANK_MODEL", _get_active("reranks").get("model", ""))
 
 def get_rerank_api_key() -> str:
-    return os.environ.get("SILICONFLOW_API_KEY", _resolve("rerank.api_key", ""))
+    return os.environ.get("SILICONFLOW_API_KEY", "") or os.environ.get("RERANK_API_KEY", "") or _get_active("reranks").get("api_key", "")
 
 def get_db_path() -> str:
     path = _resolve("retrieval.db_path", "./data_pipeline/milvus_lite.db")

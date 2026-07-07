@@ -17,6 +17,7 @@ import queue
 from functools import wraps
 from typing import Optional, Callable, Any
 
+import yaml
 import requests
 from dotenv import load_dotenv
 from pymilvus import MilvusClient
@@ -34,11 +35,13 @@ from rag.query_rewrite import (
     rewrite_query,
 )
 from config import (
-    get_embed_base_url, get_embed_model,
-    get_llm_base_url, get_llm_model,
+    get_embed_base_url, get_embed_model, get_embed_api_key,
+    get_llm_base_url, get_llm_model, get_llm_api_key,
     get_llm_max_tokens, get_llm_temperature,
     get_db_path, get_collection_name,
     get_rag_top_k, get_rerank_top_k,
+    get_rerank_api_key,
+    reload_config,
 )
 
 from data_pipeline.build_vector_db import build_db
@@ -64,8 +67,10 @@ if os.path.exists(ENV_PATH):
 
 EMBED_URL = get_embed_base_url()
 EMBED_MODEL = get_embed_model()
+EMBED_API_KEY = get_embed_api_key()
 CHAT_URL = get_llm_base_url()
 CHAT_MODEL = get_llm_model()
+CHAT_API_KEY = get_llm_api_key()
 DB_PATH = get_db_path()
 COLLECTION_NAME = get_collection_name()
 PROMPT_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "rag", "prompt.md")
@@ -103,6 +108,8 @@ def load_system_prompt():
 def get_embedding(text):
     payload = {"model": EMBED_MODEL, "input": text}
     headers = {"Content-Type": "application/json"}
+    if EMBED_API_KEY:
+        headers["Authorization"] = f"Bearer {EMBED_API_KEY}"
     r = requests.post(EMBED_URL, headers=headers, json=payload, timeout=30)
     r.raise_for_status()
     return r.json()["data"][0]["embedding"]
@@ -127,6 +134,8 @@ def chat_stream(messages, max_tokens=2048, temperature=0.3, _emit=None, debug=Fa
         "stream": True,
     }
     headers = {"Content-Type": "application/json"}
+    if CHAT_API_KEY:
+        headers["Authorization"] = f"Bearer {CHAT_API_KEY}"
 
     try:
         r = requests.post(CHAT_URL, headers=headers, json=payload, timeout=120, stream=True)
@@ -639,7 +648,7 @@ def web_main(port=8000):
         print("  pip install fastapi uvicorn")
         sys.exit(1)
 
-    app = FastAPI(title="影像报告生成系统 v2")
+    app = FastAPI(title="影像报告生成Agent v2")
 
     front_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "front")
     if os.path.isdir(front_dir):
@@ -650,7 +659,7 @@ def web_main(port=8000):
         index_path = os.path.join(front_dir, "index.html")
         if os.path.exists(index_path):
             return FileResponse(index_path)
-        return {"message": "影像报告生成系统 v2", "docs": "/docs"}
+        return {"message": "影像报告生成Agent v2", "docs": "/docs"}
 
     def _get_or_create_session(session_id):
         if session_id not in _web_sessions:
@@ -912,8 +921,132 @@ def web_main(port=8000):
             session["last_report"] = [""]
         return {"status": "ok"}
 
+    @app.get("/api/config")
+    async def get_config():
+        config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "config.yml")
+        if not os.path.exists(config_path):
+            return {"error": "配置文件不存在"}
+        with open(config_path, "r", encoding="utf-8") as f:
+            config_data = yaml.safe_load(f) or {}
+
+        # 如果 config.yml 中 api_key 为空但 .env 中有对应的 key，
+        # 则返回掩码占位符，让前端知道已配置了 key
+        for model_list_key, env_key_func in [
+            ("llms", get_llm_api_key),
+            ("embeddings", get_embed_api_key),
+            ("reranks", get_rerank_api_key),
+        ]:
+            models = config_data.get(model_list_key)
+            if isinstance(models, list):
+                for m in models:
+                    if not m.get("api_key") and env_key_func():
+                        m["api_key"] = "••••••••••••••••••••••••"
+
+        return {"config": config_data, "path": config_path}
+
+    @app.post("/api/config")
+    async def save_config(request: Request):
+        body = await request.json()
+        config_data = body.get("config")
+        if config_data is None:
+            return {"error": "缺少 config 参数"}
+
+        # 如果 api_key 是前端掩码占位符，说明实际 key 在 .env 中，清空避免写入明文
+        for model_list_key in ["llms", "embeddings", "reranks"]:
+            models = config_data.get(model_list_key)
+            if isinstance(models, list):
+                for m in models:
+                    if m.get("api_key") == "••••••••••••••••••••••••":
+                        m["api_key"] = ""
+
+        config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "config.yml")
+        with open(config_path, "w", encoding="utf-8") as f:
+            yaml.dump(config_data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+        reload_config()
+        return {"status": "ok", "message": "配置已保存并生效"}
+
+    @app.post("/api/test-model")
+    async def test_model_connection(request: Request):
+        body = await request.json()
+        model_config = body.get("model_config", {})
+        model_type = body.get("model_type", "llms")
+
+        base_url = model_config.get("base_url", "")
+        model_name = model_config.get("model", "")
+        api_key = model_config.get("api_key", "")
+
+        # 如果前端没传 key（空或掩码占位符），尝试从环境变量 / .env 兜底
+        if not api_key or api_key == "••••••••••••••••••••••••":
+            if model_type == "embeddings":
+                api_key = get_embed_api_key()
+            elif model_type == "reranks":
+                api_key = get_rerank_api_key()
+            else:
+                api_key = get_llm_api_key()
+
+        if not base_url:
+            return {"success": False, "message": "API 地址不能为空"}
+        if not model_name:
+            return {"success": False, "message": "模型名不能为空"}
+
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        if model_type == "embeddings":
+            payload = {
+                "model": model_name,
+                "input": "你好",
+            }
+        elif model_type == "reranks":
+            payload = {
+                "model": model_name,
+                "query": "测试查询",
+                "documents": ["测试文档"],
+            }
+        else:
+            payload = {
+                "model": model_name,
+                "messages": [{"role": "user", "content": "你好"}],
+                "max_tokens": 16,
+                "temperature": 0.0,
+                "stream": False,
+            }
+
+        try:
+            r = requests.post(base_url, headers=headers, json=payload, timeout=15)
+            if r.status_code == 200:
+                data = r.json()
+                if model_type == "embeddings":
+                    emb_data = data.get("data", [])
+                    if emb_data:
+                        dim = len(emb_data[0].get("embedding", []))
+                        return {"success": True, "message": f"连接成功，向量维度: {dim}"}
+                    return {"success": True, "message": "连接成功"}
+                elif model_type == "reranks":
+                    results = data.get("results", [])
+                    if results:
+                        score = results[0].get("relevance_score", "N/A")
+                        return {"success": True, "message": f"连接成功，相关性分数: {score}"}
+                    return {"success": True, "message": "连接成功"}
+                else:
+                    choices = data.get("choices", [])
+                    if choices:
+                        reply = choices[0].get("message", {}).get("content", "")
+                        return {"success": True, "message": f"连接成功，返回: {reply[:50]}"}
+                    return {"success": True, "message": "连接成功"}
+            else:
+                error_msg = r.text[:200] if r.text else f"HTTP {r.status_code}"
+                return {"success": False, "message": error_msg}
+        except requests.exceptions.Timeout:
+            return {"success": False, "message": "连接超时"}
+        except requests.exceptions.ConnectionError:
+            return {"success": False, "message": "无法连接到服务器"}
+        except Exception as e:
+            return {"success": False, "message": str(e)}
+
     print(f"\n{'='*60}")
-    print(f"  影像报告生成系统 v2 Web 服务")
+    print(f"  影像报告生成Agent v2 Web 服务")
     print(f"  {'='*60}")
     print(f"  地址: http://localhost:{port}")
     print(f"  API 文档: http://localhost:{port}/docs")
@@ -933,7 +1066,7 @@ def main():
         return
 
     print(f"\n{'='*60}")
-    print(f"  影像报告生成系统 v2 CLI")
+    print(f"  影像报告生成Agent v2 CLI")
     print(f"  {'='*60}")
     print(f"  输入问题开始对话，输入 clear 清空会话，输入 quit 退出")
     print(f"  {'='*60}\n")

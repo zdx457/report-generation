@@ -29,10 +29,11 @@ import os
 import re
 
 import requests
-from config import get_rewrite_base_url, get_rewrite_model, get_metadata_path
+from config import get_rewrite_base_url, get_rewrite_model, get_rewrite_api_key, get_metadata_path
 
 CHAT_URL = get_rewrite_base_url()
 CHAT_MODEL = get_rewrite_model()
+CHAT_API_KEY = get_rewrite_api_key()
 
 METADATA_PATH = get_metadata_path()
 
@@ -372,6 +373,8 @@ def rewrite_query(query, chat_url=None, chat_model=None, timeout=10):
         "stream": False,
     }
     headers = {"Content-Type": "application/json"}
+    if CHAT_API_KEY:
+        headers["Authorization"] = f"Bearer {CHAT_API_KEY}"
 
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
