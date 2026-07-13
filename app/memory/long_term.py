@@ -390,13 +390,22 @@ class LongTermMemory:
 
     # ── 生命周期 ──────────────────────────────────────────
 
-    def sync_from_short_term(self, short_term_memory, session_id: str):
-        entities = short_term_memory.get_entities(session_id)
-        if entities:
-            self.update_preferences(entities)
+    def sync_from_short_term(self, short_term_memory, session_id: str, entity_tracker=None):
+        if entity_tracker is not None:
+            slots = entity_tracker.to_dict()
+            prefs = {}
+            if slots.get("modality"):
+                prefs["modality"] = slots["modality"]
+            if slots.get("body_part"):
+                prefs["body_part"] = slots["body_part"]
+            if slots.get("clinical_history"):
+                prefs["clinical_history"] = slots["clinical_history"]
+            if prefs:
+                self.update_preferences(prefs)
 
-    def on_session_end(self, short_term_memory, session_id: str):
-        self.sync_from_short_term(short_term_memory, session_id)
+    def on_session_end(self, short_term_memory, session_id: str, entity_tracker=None):
+        if entity_tracker is not None:
+            self.sync_from_short_term(short_term_memory, session_id, entity_tracker)
         total_turns = short_term_memory.session_info(session_id).get("total_turns", 0)
         with self._lock:
             self._cache["stats"]["total_sessions"] += 1

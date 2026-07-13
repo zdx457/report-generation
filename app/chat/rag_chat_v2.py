@@ -1,11 +1,18 @@
 """
-rag_chat_v2.py - 三段式工作流版本
-Stage 1: 意图识别（LLM 分类器） → SEARCH / EDIT / CHAT
-Stage 2: 意图分叉（硬编码路由）
-Stage 3: 执行器（结构化提取 / 精准编辑 / 直接回复）
+rag_chat_v2.py - Tool Calling 架构版本
+
+使用 OpenAI 兼容的 Tool Calling 机制，让 LLM 自主决定调用哪个工具，
+替代硬编码的意图分类和 if/elif 路由。
+
+核心流程：
+1. 预处理（实体提取、意图检测、上下文消解）
+2. 构建消息，传入 tools schema
+3. LLM 自主决定调用工具或直接回复
+4. 执行工具，将结果返回 LLM 生成最终回复
 """
 
 import json
+import logging
 import os
 import re
 import sys
@@ -14,6 +21,7 @@ import uuid
 import shutil
 import asyncio
 import queue
+import traceback
 from functools import wraps
 from typing import Optional, Callable, Any
 
@@ -22,14 +30,17 @@ import requests
 from dotenv import load_dotenv
 from pymilvus import MilvusClient
 
+from memory.entity_tracker import EntityTracker
 from memory.short_term import ShortTermMemory
 from memory.long_term import LongTermMemory
+from memory.retriever import MemoryRetriever
+from tools.registry import ToolRegistry, ToolResult
+from prompt.builder import PromptBuilder
+from store import SessionStore
 from rag.rerank import rerank_documents, get_rerank_config
 from rag.retrieval import multi_recall
 from rag.query_rewrite import (
     parse_query_keywords,
-    is_too_vague,
-    get_clarification,
     standardize_query,
     needs_rewrite,
     rewrite_query,
@@ -92,7 +103,7 @@ def retry(max_attempts=3, delay=2, exceptions=(requests.RequestException,)):
                 except exceptions as e:
                     if attempt == max_attempts - 1:
                         raise
-                    print(f"  ⚠️ {e}，{delay}s 后重试 ({attempt+1}/{max_attempts})")
+                    logger.warning(f"{e}，{delay}s 后重试 ({attempt+1}/{max_attempts})")
                     time.sleep(delay)
             return None
         return wrapper
@@ -122,7 +133,7 @@ def _estimate_tokens(messages):
 def chat_stream(messages, max_tokens=2048, temperature=0.3, _emit=None, debug=False, caller="chat_stream"):
     total_chars, est_tokens = _estimate_tokens(messages)
     if debug:
-        print(f"📤 [{caller}] 发送请求: {len(messages)} messages, {total_chars} chars, 估算 ~{est_tokens} tokens")
+        logger.info(f"[{caller}] 发送请求: {len(messages)} messages, {total_chars} chars, 估算 ~{est_tokens} tokens")
 
     payload = {
         "model": CHAT_MODEL,
@@ -138,7 +149,7 @@ def chat_stream(messages, max_tokens=2048, temperature=0.3, _emit=None, debug=Fa
     try:
         r = requests.post(CHAT_URL, headers=headers, json=payload, timeout=120, stream=True)
     except requests.RequestException as e:
-        print(f"❌ [{caller}] 请求失败: {e}")
+        logger.error(f"[{caller}] 请求失败", exc_info=True)
         raise
 
     if not r.ok:
@@ -146,7 +157,7 @@ def chat_stream(messages, max_tokens=2048, temperature=0.3, _emit=None, debug=Fa
             error_body = r.text[:500]
         except Exception:
             error_body = "(无法读取响应体)"
-        print(f"❌ [{caller}] HTTP {r.status_code}: {error_body}")
+        logger.error(f"[{caller}] HTTP {r.status_code}: {error_body}")
         r.raise_for_status()
 
     full_text = ""
@@ -171,7 +182,7 @@ def chat_stream(messages, max_tokens=2048, temperature=0.3, _emit=None, debug=Fa
                 continue
 
     if debug:
-        print(f"📥 [{caller}] 完成: 收到 {token_count} tokens, {len(full_text)} chars")
+        logger.info(f"[{caller}] 完成: 收到 {token_count} tokens, {len(full_text)} chars")
     return full_text.strip()
 
 @retry()
@@ -219,6 +230,7 @@ def search_reports(query, top_k=RAG_TOP_K, rerank_top_k=RERANK_TOP_K, client=Non
                 entity["_rerank_score"] = rerank_score
                 reranked_entities.append(entity)
     except Exception:
+        logger.warning("重排序失败，使用原始候选列表", exc_info=True)
         reranked_entities = candidates[:rerank_top_k]
     if _emit:
         _emit("rerank", {
@@ -245,46 +257,134 @@ def search_reports(query, top_k=RAG_TOP_K, rerank_top_k=RERANK_TOP_K, client=Non
 # =============================================================================
 # 从 prompt 目录加载提示词
 # =============================================================================
-INTENT_PROMPT = load_prompt("intent")
 STRUCTURE_PROMPT = load_prompt("structure")
 EDIT_PROMPT = load_prompt("edit")
+REFINE_PROMPT = load_prompt("refine")
 CHAT_SYSTEM_PROMPT = load_prompt("chat")
 
+logger = logging.getLogger(__name__)
+
+# 默认日志格式（Web 启动时 web_main 会重新配置，CLI 启动时 main 会重新配置）
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
 # =============================================================================
-# Stage 1: 意图识别
+# Tool Calling: 非流式 LLM 调用（支持 tools 参数）
 # =============================================================================
-def classify_intent(query, history, _emit=None):
-    """调用 LLM 进行意图分类，返回 SEARCH / EDIT / CHAT"""
-    messages = [{"role": "system", "content": INTENT_PROMPT}]
+@retry()
+def chat_with_tools(messages, tools=None, max_tokens=512, temperature=0.3, debug=False):
+    """非流式 LLM 调用，支持 Tool Calling。
 
-    for msg in history[-4:]:
-        if msg.get("content", "").strip():
-            messages.append(msg)
+    当传入 tools 参数时，API 可能返回 tool_calls 而非 content。
+    返回 (content, tool_calls) 元组，其中 tool_calls 为列表或 None。
 
-    messages.append({"role": "user", "content": query})
+    Args:
+        messages: 消息列表
+        tools: OpenAI 兼容的 tools schema 列表，为 None 时不启用工具
+        max_tokens: 最大 token 数
+        temperature: 温度参数
+        debug: 是否打印调试信息
 
-    if _emit:
-        _emit("status", {"message": "正在识别意图..."})
+    Returns:
+        tuple: (content_text, tool_calls_list)
+            - content_text: 文本回复（可能为 None）
+            - tool_calls_list: tool_calls 列表，每项为 {"id": str, "name": str, "arguments": dict}
+    """
+    total_chars, est_tokens = _estimate_tokens(messages)
+    if debug:
+        logger.info(f"[chat_with_tools] 发送请求: {len(messages)} messages, {total_chars} chars, "
+                     f"tools={len(tools) if tools else 0}")
 
-    output = chat_stream(messages, max_tokens=32, temperature=0.0, _emit=None, debug=True, caller="classify_intent")
-    intent = output.strip().upper()
+    payload = {
+        "model": CHAT_MODEL,
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "stream": False,
+    }
 
-    if intent not in ("SEARCH", "EDIT", "CHAT"):
-        print(f"  ⚠️ 意图识别结果异常: {intent}，默认当作 SEARCH")
-        intent = "SEARCH"
+    if tools:
+        payload["tools"] = tools
 
-    if _emit:
-        _emit("intent", {"intent": intent})
+    headers = {"Content-Type": "application/json"}
+    if CHAT_API_KEY:
+        headers["Authorization"] = f"Bearer {CHAT_API_KEY}"
 
-    return intent
+    try:
+        r = requests.post(CHAT_URL, headers=headers, json=payload, timeout=120)
+    except requests.RequestException as e:
+        logger.error("[chat_with_tools] 请求失败", exc_info=True)
+        raise
+
+    if not r.ok:
+        try:
+            error_body = r.text[:500]
+        except Exception:
+            error_body = "(无法读取响应体)"
+        logger.error(f"[chat_with_tools] HTTP {r.status_code}: {error_body}")
+        r.raise_for_status()
+
+    data = r.json()
+    choice = data.get("choices", [{}])[0]
+    message = choice.get("message", {})
+
+    content = message.get("content", "")
+    raw_tool_calls = message.get("tool_calls", [])
+
+    tool_calls = []
+    if raw_tool_calls:
+        for tc in raw_tool_calls:
+            func_info = tc.get("function", {})
+            func_name = func_info.get("name", "")
+            func_args_str = func_info.get("arguments", "{}")
+
+            try:
+                func_args = json.loads(func_args_str)
+            except json.JSONDecodeError:
+                func_args = {}
+
+            tool_calls.append({
+                "id": tc.get("id", ""),
+                "name": func_name,
+                "arguments": func_args,
+            })
+
+    if debug:
+        if tool_calls:
+            logger.info(f"[chat_with_tools] 完成: {len(tool_calls)} tool_calls: "
+                         f"{[tc['name'] for tc in tool_calls]}")
+        else:
+            logger.info(f"[chat_with_tools] 完成: {len(content or '')} chars content")
+
+    return content, tool_calls if tool_calls else None
+
+
+# =============================================================================
+# Stage 1: 意图识别 (已移除 — 由 Tool Calling 替代)
+# =============================================================================
+# classify_intent 函数已移除。LLM 现在通过 Tool Calling 自主决定操作，
+# 不再需要硬编码的意图分类器。
 
 
 # =============================================================================
 # Stage 3A: 结构化提取
 # =============================================================================
-def structure_report(search_result, history, last_report, _emit=None):
+def structure_report(search_result, history, last_report, ltm, entity_tracker, _emit=None):
     """将检索结果 + 上一轮报告(如有) 结构化输出为 JSON"""
     sys_prompt = STRUCTURE_PROMPT
+
+    # ── 记忆注入：LTM 偏好（必须放在 System Prompt 最顶部，优先级最高） ──
+    pref_prompt = ltm.get_preference_prompt()
+    if pref_prompt:
+        sys_prompt = pref_prompt + "\n\n" + sys_prompt
+
+    # ── 记忆注入：当前实体上下文 ──
+    entity_prompt = entity_tracker.to_context_prompt()
+    if entity_prompt:
+        sys_prompt = sys_prompt + "\n\n" + entity_prompt
 
     if last_report and last_report[0]:
         try:
@@ -292,6 +392,7 @@ def structure_report(search_result, history, last_report, _emit=None):
             last_obj.pop("reasoning", None)
             last_text = json.dumps(last_obj, ensure_ascii=False)
         except Exception:
+            logger.warning("解析 last_report JSON 失败，使用原文", exc_info=True)
             last_text = last_report[0]
         sys_prompt += f"\n\n## 已生成的报告（仅参考，请勿重复其中的病变）\n{last_text}"
 
@@ -355,11 +456,82 @@ def edit_report(query, last_report, history, _emit=None):
     new_json = _extract_json(output)
 
     if isinstance(new_json, dict) and isinstance(old_json, dict):
-        if "影像学表现" in new_json and "影像学表现" in old_json:
+        # 新格式: results 数组
+        if "results" in new_json and "results" in old_json:
+            new_count = len(new_json["results"])
+            old_count = len(old_json["results"])
+            if new_count != old_count:
+                logger.warning(f"病变数量变化：旧 {old_count} → 新 {new_count}，使用旧报告兜底")
+                return old_json
+        # 兼容旧格式: 影像学表现/诊断意见 字典
+        elif "影像学表现" in new_json and "影像学表现" in old_json:
             old_keys = set(old_json["影像学表现"].keys())
             new_keys = set(new_json["影像学表现"].keys())
             if old_keys != new_keys:
-                print(f"  ⚠️ Key 集合变化：旧 {old_keys} → 新 {new_keys}，使用旧报告兜底")
+                logger.warning(f"Key 集合变化：旧 {old_keys} → 新 {new_keys}，使用旧报告兜底")
+                return old_json
+
+    return new_json if isinstance(new_json, dict) and "error" not in new_json else old_json
+
+
+# =============================================================================
+# Stage 3B-2: 重写报告（REFINE 意图）
+# =============================================================================
+def refine_report(query, last_report, history, ltm, entity_tracker, _emit=None):
+    """根据用户指令重写报告风格/详细程度，不修改医学内容主干"""
+    if not last_report or not last_report[0]:
+        return {"error": "没有可重写的报告，请先生成一份报告。"}
+
+    old_json_str = last_report[0]
+
+    try:
+        old_json = json.loads(old_json_str)
+    except json.JSONDecodeError:
+        old_json = {"raw": old_json_str}
+
+    sys_prompt = REFINE_PROMPT
+
+    # 注入 LTM 偏好和 Entity 上下文
+    preference_prompt = ""
+    if ltm:
+        preference_prompt = ltm.get_preference_prompt()
+    context_prompt = entity_tracker.get_context_prompt() if entity_tracker else ""
+
+    combined_system = sys_prompt
+    if preference_prompt:
+        combined_system = preference_prompt + "\n\n" + combined_system
+    if context_prompt:
+        combined_system = combined_system + "\n\n" + context_prompt
+
+    messages = [{"role": "system", "content": combined_system}]
+
+    for msg in history[-4:]:
+        if msg.get("content", "").strip():
+            messages.append(msg)
+
+    messages.append({"role": "user", "content": f"当前报告：\n{old_json_str}\n\n重写指令：{query}\n\n请按 JSON 格式输出重写后的完整报告，保持医学内容不变，仅调整风格/表达方式。"})
+
+    if _emit:
+        _emit("status", {"message": "正在重写报告..."})
+
+    output = chat_stream(messages, max_tokens=2048, temperature=0.5, _emit=None, debug=True, caller="refine_report")
+
+    new_json = _extract_json(output)
+
+    if isinstance(new_json, dict) and isinstance(old_json, dict):
+        # 新格式: results 数组
+        if "results" in new_json and "results" in old_json:
+            new_count = len(new_json["results"])
+            old_count = len(old_json["results"])
+            if new_count != old_count:
+                logger.warning(f"REFINE 导致病变数量变化：旧 {old_count} → 新 {new_count}，使用旧报告兜底")
+                return old_json
+        # 兼容旧格式: 影像学表现/诊断意见 字典
+        elif "影像学表现" in new_json and "影像学表现" in old_json:
+            old_keys = set(old_json["影像学表现"].keys())
+            new_keys = set(new_json["影像学表现"].keys())
+            if old_keys != new_keys:
+                logger.warning(f"REFINE 导致 Key 集合变化：旧 {old_keys} → 新 {new_keys}，使用旧报告兜底")
                 return old_json
 
     return new_json if isinstance(new_json, dict) and "error" not in new_json else old_json
@@ -402,7 +574,7 @@ def _extract_json(text):
         except json.JSONDecodeError:
             pass
 
-    print(f"  ⚠️ 无法解析 JSON: {text[:200]}...")
+    logger.warning(f"无法解析 JSON: {text[:200]}...")
     return {"error": "JSON 解析失败", "raw": text[:500]}
 
 
@@ -410,48 +582,171 @@ def _extract_json(text):
 # JSON 报告 → Markdown 展示文本
 # =============================================================================
 def json_to_display(report_json):
-    """将 JSON 报告转换为 Markdown 展示文本"""
+    """将 JSON 报告转换为 Markdown 展示文本
+
+    支持新格式 (results 数组) 和旧格式 (影像学表现/诊断意见 字典) 兼容。
+    """
     if isinstance(report_json, str):
-        return report_json
+        return report_json.replace(r'\n', '\n').replace(r'\t', '\t')
 
     if not isinstance(report_json, dict) or "error" in report_json:
-        return report_json.get("raw", str(report_json))
+        raw = report_json.get("raw", str(report_json))
+        return raw.replace(r'\n', '\n').replace(r'\t', '\t')
 
     lines = []
 
-    imaging = report_json.get("影像学表现", {})
-    if imaging:
+    # 新格式: results 数组 [{影像学表现, 诊断意见}, ...]
+    results = report_json.get("results", [])
+    if results:
         lines.append("## 一、影像学表现")
         lines.append("")
-        for name, desc in imaging.items():
-            lines.append(f"{desc}")
-            lines.append("")
+        for item in results:
+            imaging = item.get("影像学表现", "")
+            if imaging:
+                for line in str(imaging).replace(r'\n', '\n').splitlines():
+                    lines.append(line)
+                lines.append("")
 
-    diagnosis = report_json.get("诊断意见", {})
-    if diagnosis:
         lines.append("## 二、诊断意见")
         lines.append("")
-        for name, opinion in diagnosis.items():
-            lines.append(f"{opinion}")
+        for item in results:
+            diagnosis = item.get("诊断意见", "")
+            if diagnosis:
+                for line in str(diagnosis).replace(r'\n', '\n').splitlines():
+                    lines.append(line)
+                lines.append("")
+    else:
+        # 兼容旧格式: {影像学表现: {病变名称: 描述}, 诊断意见: {病变名称: 意见}}
+        imaging = report_json.get("影像学表现", {})
+        if imaging:
+            lines.append("## 一、影像学表现")
             lines.append("")
+            if isinstance(imaging, dict):
+                for name, desc in imaging.items():
+                    for line in str(desc).replace(r'\n', '\n').splitlines():
+                        lines.append(line)
+                    lines.append("")
+            else:
+                for line in str(imaging).replace(r'\n', '\n').splitlines():
+                    lines.append(line)
+                lines.append("")
+
+        diagnosis = report_json.get("诊断意见", {})
+        if diagnosis:
+            lines.append("## 二、诊断意见")
+            lines.append("")
+            if isinstance(diagnosis, dict):
+                for name, opinion in diagnosis.items():
+                    for line in str(opinion).replace(r'\n', '\n').splitlines():
+                        lines.append(line)
+                    lines.append("")
+            else:
+                for line in str(diagnosis).replace(r'\n', '\n').splitlines():
+                    lines.append(line)
+                lines.append("")
 
     return "\n".join(lines).strip()
 
 
 # =============================================================================
-# 主流程：run_pipeline
+# 主流程：run_pipeline（Tool Calling 架构）
 # =============================================================================
-def run_pipeline(query, session_id, stm, ltm, client, last_report, _emit):
-    """三段式工作流主流程"""
-    # ── 预处理 ──
-    if is_too_vague(query):
-        clarification = get_clarification(query)
-        _emit("message", {"content": clarification})
-        return clarification
+def _build_tool_registry(
+    ltm, entity_tracker, client, last_report, _emit,
+):
+    """构建并注册工具到 ToolRegistry。
 
-    enhanced = stm.resolve_context(session_id, query)
+    将 chat_stream 包装为符合 Tool Handler 签名的函数传入各工具。
+
+    Args:
+        ltm: LongTermMemory 实例
+        entity_tracker: EntityTracker 实例
+        client: MilvusClient 实例
+        last_report: 上一轮报告的可变引用
+        _emit: SSE 事件发射器
+
+    Returns:
+        ToolRegistry: 已注册所有工具的注册中心
+    """
+    from tools.rag_tool import RAG_SEARCH_SCHEMA, create_rag_search_handler
+    from tools.edit_tool import EDIT_REPORT_SCHEMA, create_edit_report_handler
+    from tools.refine_tool import REFINE_REPORT_SCHEMA, create_refine_report_handler
+
+    registry = ToolRegistry()
+
+    def _chat_fn(messages, max_tokens=2048, temperature=0.3, _emit=None, debug=False, caller="tool"):
+        return chat_stream(messages, max_tokens=max_tokens, temperature=temperature,
+                           _emit=_emit, debug=debug, caller=caller)
+
+    def _search_reports_fn(query, _emit=None):
+        return search_reports(query, client=client, _emit=_emit)
+
+    rag_handler = create_rag_search_handler(
+        chat_fn=_chat_fn,
+        ltm=ltm,
+        entity_tracker=entity_tracker,
+        get_embedding_fn=get_embedding,
+        search_reports_fn=_search_reports_fn,
+        _emit_fn=_emit,
+        last_report=last_report,
+    )
+    registry.register("rag_search", RAG_SEARCH_SCHEMA, rag_handler)
+
+    edit_handler = create_edit_report_handler(
+        chat_fn=_chat_fn,
+        _emit_fn=_emit,
+        last_report=last_report,
+    )
+    registry.register("edit_report", EDIT_REPORT_SCHEMA, edit_handler)
+
+    refine_handler = create_refine_report_handler(
+        chat_fn=_chat_fn,
+        ltm=ltm,
+        entity_tracker=entity_tracker,
+        _emit_fn=_emit,
+        last_report=last_report,
+    )
+    registry.register("refine_report", REFINE_REPORT_SCHEMA, refine_handler)
+
+    return registry
+
+
+def run_pipeline(query, session_id, stm, entity_tracker, ltm, client, last_report, _emit):
+    """Tool Calling 架构主流程
+
+    记忆模块集成点：
+    1. Phase 1 (Pre-LLM): 实体提取 → 意图检测 → 上下文消解
+    2. 切换意图: 清空 STM 和 last_report (彻底清洗)
+    3. Phase 2 (Tool Calling): LLM 自主决定调用工具或直接回复
+    4. Phase 3 (Post-LLM): 更新 STM，记录用户偏好
+    """
+    logger.info(f"── run_pipeline 开始: session={session_id}, query={query[:50]}...")
+
+    # ── Phase 1: 输入处理 ──
+    # 1. 实体提取：从用户输入提取实体更新槽位
+    changes = entity_tracker.update_from_query(query)
+    if changes:
+        logger.info(f"实体更新: {changes}")
+        _emit("entity_update", {"changes": changes, "slots": entity_tracker.slots})
+
+    # 2. 意图检测：new_session / append / switch
+    detected_intent = entity_tracker.detect_intent(query)
+    logger.info(f"实体意图: {detected_intent}, slots: {entity_tracker.slots}")
+
+    # 切换意图：必须彻底清空，严禁旧病灶残留
+    if detected_intent == "switch":
+        logger.info("检测到切换意图，清空会话上下文")
+        stm.clear(session_id)
+        if last_report:
+            last_report[0] = ""
+        entity_tracker.apply_switch(query)
+        _emit("intent_switch", {"message": "已清空旧上下文，开始新检查"})
+
+    # 3. 上下文消解：补全省略信息
+    enhanced = entity_tracker.resolve_context(query)
     enhanced = standardize_query(enhanced)
     if enhanced != query:
+        logger.info(f"上下文消解: '{query}' → '{enhanced}'")
         _emit("context_resolve", {"original": query, "resolved": enhanced})
 
     if needs_rewrite(enhanced):
@@ -459,93 +754,278 @@ def run_pipeline(query, session_id, stm, ltm, client, last_report, _emit):
         rewritten = rewrite_query(enhanced)
         if rewritten and rewritten != enhanced:
             enhanced = rewritten
+            logger.info(f"查询改写: '{original}' → '{rewritten}'")
             _emit("query_rewrite", {"original": original, "rewritten": rewritten})
 
     history = stm.get_history(session_id)
 
+    # ── Phase 2: Tool Calling 主循环 ──
+    # 构建工具注册中心
+    registry = _build_tool_registry(ltm, entity_tracker, client, last_report, _emit)
+    tools_schema = registry.get_tools_schema()
+    logger.info(f"已注册工具: {list(registry._tools.keys())}")
 
-    # ── Stage 1: 意图识别 ──
-    intent = classify_intent(enhanced, history, _emit=_emit)
-    print(f"  🎯 意图: {intent}")
+    # ── 记忆检索注入：按需检索最相关的 LTM 偏好和 STM 历史 ──
+    retriever = MemoryRetriever(get_embedding)
+    retriever.index_ltm(ltm.get_preferences())
+    retriever.index_stm(history)
+    relevant = retriever.search_relevant(enhanced, top_k_ltm=3, top_k_stm=3)
+    logger.info(f"记忆检索: LTM={len(relevant['ltm'])}条, STM={len(relevant['stm'])}条")
+    if _emit:
+        _emit("memory_retrieval", {
+            "ltm": relevant["ltm"],
+            "stm": relevant["stm"],
+            "query": enhanced[:50],
+        })
 
-    # ── Stage 2: 意图分叉 ──
-    if intent == "CHAT":
-        reply = chat_reply(enhanced, history, _emit=_emit)
-        _emit("message", {"content": reply})
-        if last_report:
-            last_report[0] = last_report[0] or ""
-        stm.add_turn(session_id, query, reply)
-        return reply
+    # 构建系统消息：注入检索后的相关 LTM 偏好 + Entity 上下文
+    sys_prompt = PromptBuilder.build(
+        "tool_orchestrator",
+        ltm_prefs=relevant["ltm"],
+        entity_context=entity_tracker.to_context_prompt(),
+    )
 
-    elif intent == "EDIT":
-        result_json = edit_report(enhanced, last_report, history, _emit=_emit)
-        if isinstance(result_json, dict) and "error" in result_json:
-            _emit("error", {"message": result_json["error"]})
-            return result_json["error"]
+    # 注入检索后的相关对话历史（供 LLM 参考上下文）
+    if relevant["stm"]:
+        stm_context = "\n".join(f"- {msg}" for msg in relevant["stm"])
+        sys_prompt += f"\n\n---\n\n## 相关历史对话\n{stm_context}"
 
-        new_json_str = json.dumps(result_json, ensure_ascii=False, indent=2)
-        last_report[0] = new_json_str
-        display_text = json_to_display(result_json)
-        _emit("report", {"content": display_text})
-        stm.add_turn(session_id, query, display_text)
-        return display_text
+    # 注入上一轮报告信息（供工具决策参考）
+    if last_report and last_report[0]:
+        sys_prompt += (
+            f"\n\n---\n\n"
+            f"## 当前已有报告\n"
+            f"以下为上一轮生成的报告 JSON，如果用户要求修改或重写，请直接使用 edit_report 或 "
+            f"refine_report 工具，无需重新检索。\n"
+            f"```json\n{last_report[0][:2000]}\n```"
+        )
 
-    elif intent == "SEARCH":
+    # 构建消息列表
+    messages = [{"role": "system", "content": sys_prompt}]
+
+    for msg in history[-6:]:
+        content = msg.get("content", "").strip()
+        if not content:
+            continue
+        role = msg.get("role", "")
+        if role == "assistant" and len(content) > 500:
+            content = content[:500] + "...（已省略后续内容）"
+        messages.append({"role": role, "content": content})
+
+    messages.append({"role": "user", "content": enhanced})
+
+    # ── 第一次 LLM 调用（带 tools） ──
+    if _emit:
+        _emit("status", {"message": "正在分析请求..."})
+
+    logger.info(f"第一次 LLM 调用 (带 tools): {len(messages)} 条消息, tools={[t['function']['name'] for t in tools_schema]}")
+    content, tool_calls = chat_with_tools(
+        messages,
+        tools=tools_schema,
+        max_tokens=512,
+        temperature=0.3,
+        debug=True,
+    )
+
+    # ── 如果没有工具调用，直接回复 ──
+    if not tool_calls:
+        if content:
+            if _emit:
+                _emit("message", {"content": content})
+            stm.add_turn(session_id, query, content)
+            logger.info(f"── run_pipeline 完成: 直接回复 (无工具调用), content长度={len(content)}")
+            return content
+        else:
+            _emit("error", {"message": "模型未返回有效回复"})
+            logger.warning(f"── run_pipeline 完成: 模型未返回有效回复")
+            return "抱歉，模型未返回有效回复。"
+
+    # ── 执行工具调用 ──
+    if _emit:
+        _emit("intent", {"intent": "TOOL_CALL", "tools": [tc["name"] for tc in tool_calls]})
+
+    logger.info(f"LLM 选择工具: {[tc['name'] for tc in tool_calls]}")
+    for tc in tool_calls:
+        logger.info(f"  工具参数: {tc['name']}({json.dumps(tc['arguments'], ensure_ascii=False)})")
+
+    # 将 assistant 消息（含 tool_calls）追加到消息列表
+    assistant_tool_calls = []
+    for tc in tool_calls:
+        assistant_tool_calls.append({
+            "id": tc["id"],
+            "type": "function",
+            "function": {
+                "name": tc["name"],
+                "arguments": json.dumps(tc["arguments"], ensure_ascii=False),
+            },
+        })
+
+    messages.append({
+        "role": "assistant",
+        "content": content or None,
+        "tool_calls": assistant_tool_calls,
+    })
+
+    # 执行每个工具
+    tool_results = []
+    any_final = False
+
+    for tc in tool_calls:
+        tool_name = tc["name"]
+        tool_args = tc["arguments"]
+
+        # 对 edit_report 和 refine_report，自动注入 current_report（主循环兜底）
+        if tool_name in ("edit_report", "refine_report"):
+            if "current_report" not in tool_args or not tool_args["current_report"]:
+                if last_report and last_report[0]:
+                    tool_args["current_report"] = last_report[0]
+                else:
+                    err_msg = f"工具 {tool_name} 需要已有报告，但当前没有可用的报告。"
+                    _emit("error", {"message": err_msg})
+                    tool_results.append((tc["id"], ToolResult(
+                        content=json.dumps({"error": err_msg}, ensure_ascii=False),
+                        is_final=False,
+                    )))
+                    continue
+
+        result = registry.execute(tc["id"], tool_name, tool_args)
+        tool_results.append((tc["id"], result))
+
+        if result.is_final:
+            any_final = True
+
+        logger.info(f"工具执行完成: {tool_name}, 结果长度={len(result.content)}, is_final={result.is_final}")
         if _emit:
-            _emit("search", {"query": enhanced})
-        _emit("status", {"message": f"开始检索：{enhanced}"})
-        search_result = search_reports(enhanced, client=client, _emit=_emit)
-        _emit("status", {"message": "检索完成，开始结构化提取..."})
-        result_json = structure_report(search_result, history, last_report, _emit=_emit)
-        if isinstance(result_json, dict) and "error" in result_json:
-            _emit("error", {"message": result_json.get("raw", str(result_json))})
-            return result_json.get("raw", str(result_json))
+            _emit("tool_executed", {
+                "tool": tool_name,
+                "params": tool_args,
+                "result_length": len(result.content),
+                "is_final": result.is_final,
+            })
 
-        # 合并新旧报告：已有病变保留，新增病变追加
-        if last_report and last_report[0]:
+    # ── 将工具结果追加到消息列表 ──
+    for tool_id, result in tool_results:
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tool_id,
+            "content": result.content,
+        })
+
+    # ── 决策：是否需要二次 LLM 调用 ──
+    # 如果所有工具都返回 is_final=True（报告类结果），跳过二次 LLM 调用，
+    # 直接将报告内容发送给前端，避免 LLM 二次总结引入幻觉或改变医学术语。
+    final_content = None
+
+    if any_final:
+        logger.info("工具返回 is_final=True，跳过二次 LLM 调用，直接发送报告")
+        if _emit:
+            _emit("status", {"message": "报告已生成", "phase": "done"})
+
+        # ── 在返回前必须保存 last_report，否则下一轮无法编辑 ──
+        for tool_id, result in tool_results:
+            if not result.is_final:
+                continue
             try:
-                old_json = json.loads(last_report[0])
-                merged = {}
-                for section in ("影像学表现", "诊断意见"):
-                    merged[section] = {}
-                    if section in old_json and isinstance(old_json[section], dict):
-                        merged[section].update(old_json[section])
-                    if section in result_json and isinstance(result_json[section], dict):
-                        for k, v in result_json[section].items():
-                            if k not in merged[section]:
-                                merged[section][k] = v
-                new_reasoning = result_json.get("reasoning", "")
-                old_reasoning = old_json.get("reasoning", "")
-                if new_reasoning:
-                    merged["reasoning"] = f"[第1轮] {old_reasoning}\n[本轮] {new_reasoning}" if old_reasoning else new_reasoning
-                result_json = merged
+                result_json = json.loads(result.content)
+                if isinstance(result_json, dict) and ("results" in result_json or "影像学表现" in result_json or "诊断意见" in result_json):
+                    last_report[0] = result.content
+                    logger.info(f"已保存 last_report (长度: {len(result.content)})")
+                    break
+            except Exception as e:
+                logger.warning("保存 last_report 失败", exc_info=True)
+
+        # 从工具结果中提取报告内容，直接发送给前端
+        for tool_id, result in tool_results:
+            if not result.is_final:
+                continue
+            try:
+                result_json = json.loads(result.content)
+                if isinstance(result_json, dict) and "error" not in result_json:
+                    if "results" in result_json or "影像学表现" in result_json or "诊断意见" in result_json:
+                        display = json_to_display(result_json)
+                        _emit("report", {"content": display})
+                        stm.add_turn(session_id, query, display)
+                        logger.info(f"── run_pipeline 完成: is_final 报告直接发送, display长度={len(display)}")
+                        return display
             except Exception:
-                pass  # 合并失败则用新报告
+                logger.error("解析工具结果失败", exc_info=True)
 
-        new_json_str = json.dumps(result_json, ensure_ascii=False, indent=2)
-        last_report[0] = new_json_str
-        display_text = json_to_display(result_json)
-        _emit("report", {"content": display_text})
-        stm.add_turn(session_id, query, display_text)
-        return display_text
-
+        # 兜底：发送工具结果原文
+        for tool_id, result in tool_results:
+            if result.is_final:
+                _emit("report", {"content": result.content[:2000]})
+                stm.add_turn(session_id, query, result.content[:2000])
+                logger.info(f"── run_pipeline 完成: is_final 兜底发送, content长度={len(result.content[:2000])}")
+                return result.content[:2000]
     else:
-        _emit("error", {"message": f"未知意图: {intent}"})
-        return f"未知意图: {intent}"
+        # ── 非最终结果：二次 LLM 调用（不带 tools），生成自然语言回复 ──
+        if _emit:
+            _emit("status", {"message": "正在生成回复..."})
+
+        logger.info("非最终结果，执行第二次 LLM 调用")
+        final_content, _ = chat_with_tools(
+            messages,
+            tools=None,
+            max_tokens=1024,
+            temperature=0.3,
+            debug=True,
+        )
+
+        if not final_content:
+            final_content = "操作完成，请查看结果。"
+            for tool_id, result in tool_results:
+                try:
+                    result_json = json.loads(result.content)
+                    if isinstance(result_json, dict) and "error" not in result_json:
+                        display = json_to_display(result_json)
+                        if display:
+                            final_content = display
+                            break
+                except Exception:
+                    logger.error("二次LLM调用后解析工具结果失败", exc_info=True)
+
+        if final_content:
+            _emit("message", {"content": final_content})
+            stm.add_turn(session_id, query, final_content)
+            logger.info(f"── run_pipeline 完成: 二次LLM回复, content长度={len(final_content)}")
+            return final_content
+
+    # ── Phase 3: 后处理 ──
+    # 从工具结果中提取并更新 last_report
+    for tool_id, result in tool_results:
+        try:
+            result_json = json.loads(result.content)
+            if isinstance(result_json, dict) and "error" not in result_json:
+                if "results" in result_json or "影像学表现" in result_json or "诊断意见" in result_json:
+                    last_report[0] = json.dumps(result_json, ensure_ascii=False, indent=2)
+                    break
+        except Exception:
+            logger.error("后处理阶段解析工具结果失败", exc_info=True)
+
+    logger.info(f"── run_pipeline 完成: 后处理兜底, 操作完成")
+    return "操作完成"
 
 
 # =============================================================================
 # Web 服务
 # =============================================================================
-_web_sessions = {}
-
 def web_main(port=8000):
     if not WEB_AVAILABLE:
+        logger.error("Web 依赖缺失: 需要安装 fastapi 和 uvicorn")
         print("错误: 需要安装 fastapi 和 uvicorn")
         print("  pip install fastapi uvicorn")
         sys.exit(1)
 
+    # 确保日志配置正确
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
+
     app = FastAPI(title="影像报告生成Agent v2")
+    store = SessionStore(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "data", "sessions.db"))
 
     front_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "front")
     if os.path.isdir(front_dir):
@@ -559,18 +1039,53 @@ def web_main(port=8000):
         return {"message": "影像报告生成Agent v2", "docs": "/docs"}
 
     def _get_or_create_session(session_id):
-        if session_id not in _web_sessions:
+        """从 SQLite 加载或创建会话，返回内存对象字典"""
+        if store.session_exists(session_id):
+            # ── 恢复已有会话 ──
+            session_data = store.load_session(session_id)
+            logger.info(f"恢复会话: {session_id}, 标题={session_data['title']}, 轮次={len(session_data['turns'])}")
             stm = ShortTermMemory(max_rounds=get_max_rounds())
+            entity_tracker = EntityTracker(llm_chat_fn=chat_stream)
             ltm = LongTermMemory()
             client = MilvusClient(DB_PATH)
             client.load_collection(COLLECTION_NAME)
-            _web_sessions[session_id] = {
+
+            # 恢复对话历史到 STM
+            for turn in session_data["turns"]:
+                stm.add_turn(session_id, turn["user_input"], turn["assistant_output"])
+
+            # 恢复实体槽位（合并默认值，防止缺失键导致 KeyError）
+            if session_data["state"]["entity_slots"]:
+                entity_tracker.slots.update(session_data["state"]["entity_slots"])
+
+            # 恢复 last_report
+            last_report = [session_data["state"]["last_report"]]
+
+            return {
                 "stm": stm,
+                "entity_tracker": entity_tracker,
+                "ltm": ltm,
+                "client": client,
+                "last_report": last_report,
+            }
+        else:
+            # ── 创建新会话 ──
+            logger.info(f"创建新会话: {session_id}")
+            stm = ShortTermMemory(max_rounds=get_max_rounds())
+            entity_tracker = EntityTracker(llm_chat_fn=chat_stream)
+            ltm = LongTermMemory()
+            client = MilvusClient(DB_PATH)
+            client.load_collection(COLLECTION_NAME)
+
+            store.create_session(session_id)
+
+            return {
+                "stm": stm,
+                "entity_tracker": entity_tracker,
                 "ltm": ltm,
                 "client": client,
                 "last_report": [""],
             }
-        return _web_sessions[session_id]
 
     @app.post("/api/chat")
     async def chat(request: Request):
@@ -581,7 +1096,11 @@ def web_main(port=8000):
         if not query:
             return {"error": "query 不能为空"}
 
+        logger.info(f"收到查询: session={session_id}, query={query[:50]}...")
         session = _get_or_create_session(session_id)
+        stm = session["stm"]
+        entity_tracker = session["entity_tracker"]
+        last_report = session["last_report"]
 
         async def event_stream():
             loop = asyncio.get_event_loop()
@@ -591,17 +1110,37 @@ def web_main(port=8000):
                 try:
                     event_queue.put_nowait(json.dumps({"type": event_type, **data}, ensure_ascii=False))
                 except Exception:
-                    pass
+                    logger.warning("SSE事件入队失败", exc_info=True)
 
             def run():
                 try:
-                    run_pipeline(
+                    # 记录本轮对话前的轮次索引
+                    info_before = stm.session_info(session_id)
+                    turn_index = info_before.get("total_turns", 0)
+
+                    result = run_pipeline(
                         query, session_id,
-                        session["stm"], session["ltm"], session["client"],
-                        session["last_report"],
+                        stm, entity_tracker, session["ltm"], session["client"],
+                        last_report,
                         _emit_sse,
                     )
+
+                    if result:
+                        logger.info(f"run_pipeline 完成: result长度={len(result)}")
+
+                    # ── 持久化：保存对话记录和会话状态 ──
+                    try:
+                        store.save_turn(session_id, turn_index, query, result or "")
+                        store.save_state(session_id, entity_tracker.slots, last_report[0])
+                        # 如果第一轮对话，自动更新标题
+                        if turn_index == 0:
+                            title = query[:20] if len(query) > 20 else query
+                            store.update_title(session_id, title)
+                            logger.info(f"会话标题已更新: {session_id} → {title}")
+                    except Exception as e:
+                        logger.warning("保存会话失败: %s", e)
                 except Exception as e:
+                    logger.error("run_pipeline 执行异常", exc_info=True)
                     _emit_sse("error", {"message": str(e)})
                 finally:
                     event_queue.put_nowait("[DONE]")
@@ -624,9 +1163,10 @@ def web_main(port=8000):
     async def info(session_id: str = "default"):
         session = _get_or_create_session(session_id)
         session_info = session["stm"].session_info(session_id)
+        entity = session["entity_tracker"]
         return {
             "current_turns": session_info.get("current_turns", 0),
-            "entity_count": session_info.get("entity_count", 0),
+            "entity_slots": entity.slots,
             "has_last_report": bool(session["last_report"][0]),
         }
 
@@ -634,9 +1174,10 @@ def web_main(port=8000):
     async def memory(session_id: str = "default"):
         session = _get_or_create_session(session_id)
         stm = session["stm"]
+        entity = session["entity_tracker"]
         info = stm.session_info(session_id)
         history = stm.get_history(session_id)
-        entities = stm.get_entities(session_id)
+        entities = entity.slots
         summaries = stm.get_summaries(session_id)
 
         turns = []
@@ -667,7 +1208,7 @@ def web_main(port=8000):
                 total = len(client.query(COLLECTION_NAME, filter="", output_fields=["count(*)"]))
                 client.close()
         except Exception:
-            pass
+            logger.warning("查询 Milvus 知识库状态失败", exc_info=True)
         slices_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "app", "data_pipeline", "xlsx_slices")
         md_count = len([f for f in os.listdir(slices_dir) if f.endswith(".md")]) if os.path.isdir(slices_dir) else 0
         metadata_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data_pipeline", "report_template", "metadata.json")
@@ -801,22 +1342,27 @@ def web_main(port=8000):
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
     @app.delete("/api/session")
-    async def clear_session(session_id: str = "default"):
-        if session_id in _web_sessions:
-            session = _web_sessions[session_id]
-            session["stm"].clear(session_id)
-            session["last_report"] = [""]
+    async def delete_session(session_id: str = "default"):
+        store.delete_session(session_id)
         return {"status": "ok"}
 
     @app.post("/api/clear")
     async def clear_session_post(request: Request):
         body = await request.json()
         session_id = body.get("session_id", "default")
-        if session_id in _web_sessions:
-            session = _web_sessions[session_id]
-            session["stm"].clear(session_id)
-            session["last_report"] = [""]
+        store.delete_session(session_id)
+        store.create_session(session_id)
         return {"status": "ok"}
+
+    @app.get("/api/sessions")
+    async def list_sessions():
+        return {"sessions": store.list_sessions()}
+
+    @app.post("/api/session/new")
+    async def new_session():
+        session_id = SessionStore.generate_session_id()
+        store.create_session(session_id)
+        return {"session_id": session_id}
 
     @app.get("/api/config")
     async def get_config():
@@ -936,12 +1482,16 @@ def web_main(port=8000):
                 error_msg = r.text[:200] if r.text else f"HTTP {r.status_code}"
                 return {"success": False, "message": error_msg}
         except requests.exceptions.Timeout:
+            logger.warning("知识库上传：连接超时")
             return {"success": False, "message": "连接超时"}
         except requests.exceptions.ConnectionError:
+            logger.warning("知识库上传：无法连接到服务器")
             return {"success": False, "message": "无法连接到服务器"}
         except Exception as e:
+            logger.error("知识库上传失败", exc_info=True)
             return {"success": False, "message": str(e)}
 
+    logger.info(f"Web 服务启动: http://localhost:{port}, 模型={CHAT_MODEL}, Embedding={EMBED_MODEL}")
     print(f"\n{'='*60}")
     print(f"  影像报告生成Agent v2 Web 服务")
     print(f"  {'='*60}")
@@ -970,6 +1520,7 @@ def main():
 
     SESSION_ID = f"rag_v2_{uuid.uuid4().hex[:8]}"
     stm = ShortTermMemory(max_rounds=get_max_rounds())
+    entity_tracker = EntityTracker(llm_chat_fn=chat_stream)
     ltm = LongTermMemory()
     client = MilvusClient(DB_PATH)
     client.load_collection(COLLECTION_NAME)
@@ -982,6 +1533,10 @@ def main():
             print(f"💭 推理: {data['content']}")
         elif event_type == "intent":
             print(f"🎯 意图: {data['intent']}")
+        elif event_type == "entity_update":
+            print(f"🔄 实体更新: {data['changes']}, 槽位: {data['slots']}")
+        elif event_type == "intent_switch":
+            print(f"🔄 {data['message']}")
         elif event_type == "error":
             print(f"❌ 错误: {data['message']}")
 
@@ -997,18 +1552,23 @@ def main():
 
             if user_input.lower() == "clear":
                 stm.clear(SESSION_ID)
+                entity_tracker.clear()
                 last_report[0] = ""
                 print("🧹 会话已清空\n")
                 continue
 
             run_pipeline(
                 user_input, SESSION_ID,
-                stm, ltm, client,
+                stm, entity_tracker, ltm, client,
                 last_report,
                 _emit,
             )
     except KeyboardInterrupt:
         print("\n👋 再见！")
+    except Exception as e:
+        logger.error("CLI 主循环未捕获异常", exc_info=True)
+        print(f"\n❌ 未捕获异常: {e}")
+        traceback.print_exc()
 
 
 if __name__ == "__main__":

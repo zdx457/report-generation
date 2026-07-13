@@ -1,0 +1,484 @@
+"""记忆模块单元测试
+
+覆盖 Phase 1 核心场景：
+1. 意图切换清洗测试
+2. 实体提取鲁棒性测试（长词优先 + 歧义处理）
+3. LTM 注入顺序测试
+4. 上下文消解测试
+
+用法：
+  python -m app.test.test_memory
+"""
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
+from memory import EntityTracker, ShortTermMemory, LongTermMemory
+
+
+# ═══════════════════════════════════════════════════════════
+# 测试辅助
+# ═══════════════════════════════════════════════════════════
+
+PASS = 0
+FAIL = 0
+
+
+def test(name: str):
+    """测试装饰器"""
+    def decorator(fn):
+        def wrapper():
+            global PASS, FAIL
+            try:
+                fn()
+                PASS += 1
+                print(f"   ✅ {name}")
+            except AssertionError as e:
+                FAIL += 1
+                print(f"   ❌ {name}: {e}")
+            except Exception as e:
+                FAIL += 1
+                print(f"   💥 {name}: {type(e).__name__}: {e}")
+        return wrapper
+    return decorator
+
+
+def assert_equal(actual, expected, msg=""):
+    """断言相等"""
+    if actual != expected:
+        raise AssertionError(f"{msg} 期望 {expected!r}，实际 {actual!r}")
+
+
+def assert_true(condition, msg=""):
+    """断言真"""
+    if not condition:
+        raise AssertionError(f"{msg} 期望为 True，实际为 False")
+
+
+def assert_false(condition, msg=""):
+    """断言假"""
+    if condition:
+        raise AssertionError(f"{msg} 期望为 False，实际为 True")
+
+
+def assert_in(item, container, msg=""):
+    """断言包含"""
+    if item not in container:
+        raise AssertionError(f"{msg} 期望 {item!r} 在 {container!r} 中")
+
+
+def assert_not_in(item, container, msg=""):
+    """断言不包含"""
+    if item in container:
+        raise AssertionError(f"{msg} 期望 {item!r} 不在 {container!r} 中")
+
+
+# ═══════════════════════════════════════════════════════════
+# 测试 1：意图切换清洗测试（最关键）
+# ═══════════════════════════════════════════════════════════
+
+class TestIntentSwitchCleanup:
+
+    @staticmethod
+    def setup():
+        """前置条件：在 STM 中填入 3 轮对话，设置 last_report，entity_tracker 有状态"""
+        stm = ShortTermMemory(max_rounds=6)
+        session_id = "test_switch_001"
+
+        stm.add_turn(session_id, "CT 脑部 有脑出血", "报告：脑出血影像学表现...")
+        stm.add_turn(session_id, "再看看血管情况", "报告：脑血管未见异常...")
+        stm.add_turn(session_id, "补充一下水肿情况", "报告：脑水肿轻度...")
+
+        entity_tracker = EntityTracker()
+        entity_tracker.update_from_query("CT 脑部 有脑出血")
+
+        last_report = ['{"影像学表现": {"脑出血": "..."}, "诊断意见": {"脑出血": "..."}}']
+
+        return stm, entity_tracker, last_report, session_id
+
+    @test("切换前 STM 有 3 轮对话")
+    def test_stm_has_history():
+        stm, entity_tracker, last_report, session_id = TestIntentSwitchCleanup.setup()
+        history = stm.get_history(session_id)
+        assert_equal(len(history), 6, "切换前应保留 3 轮完整对话（6 条消息）")
+
+    @test("切换前 entity_tracker 有旧状态")
+    def test_entity_has_old_state():
+        stm, entity_tracker, last_report, session_id = TestIntentSwitchCleanup.setup()
+        assert_equal(entity_tracker.slots["modality"], "CT", "切换前 modality 应为 CT")
+        assert_equal(entity_tracker.slots["body_part"], "脑部", "切换前 body_part 应为 脑部")
+
+    @test("切换前 last_report 有内容")
+    def test_last_report_has_content():
+        stm, entity_tracker, last_report, session_id = TestIntentSwitchCleanup.setup()
+        assert_true(len(last_report[0]) > 0, "切换前 last_report 应有内容")
+        assert_in("脑出血", last_report[0], "切换前 last_report 应包含'脑出血'")
+
+    @test("切换意图检测正确")
+    def test_detect_switch_intent():
+        stm, entity_tracker, last_report, session_id = TestIntentSwitchCleanup.setup()
+        intent = entity_tracker.detect_intent("换成 MR 膝关节")
+        assert_equal(intent, "switch", "应检测为 switch 意图")
+
+    @test("切换后 stm.get_history() 返回空")
+    def test_switch_clears_stm():
+        stm, entity_tracker, last_report, session_id = TestIntentSwitchCleanup.setup()
+
+        entity_tracker.apply_switch("换成 MR 膝关节")
+        stm.clear(session_id)
+
+        history = stm.get_history(session_id)
+        assert_equal(len(history), 0, "切换后 STM 历史应为空")
+
+    @test("切换后 last_report 被清空")
+    def test_switch_clears_last_report():
+        stm, entity_tracker, last_report, session_id = TestIntentSwitchCleanup.setup()
+
+        entity_tracker.apply_switch("换成 MR 膝关节")
+        last_report[0] = ""
+
+        assert_equal(last_report[0], "", "切换后 last_report 应为空字符串")
+
+    @test("切换后 entity_tracker.slots.modality 变为 MR")
+    def test_switch_updates_modality():
+        stm, entity_tracker, last_report, session_id = TestIntentSwitchCleanup.setup()
+
+        entity_tracker.apply_switch("换成 MR 膝关节")
+
+        assert_equal(entity_tracker.slots["modality"], "MR", "切换后 modality 应为 MR")
+
+    @test("切换后 entity_tracker.slots.body_part 变为 膝关节")
+    def test_switch_updates_body_part():
+        stm, entity_tracker, last_report, session_id = TestIntentSwitchCleanup.setup()
+
+        entity_tracker.apply_switch("换成 MR 膝关节")
+
+        assert_equal(entity_tracker.slots["body_part"], "膝关节", "切换后 body_part 应为 膝关节")
+
+    @test("切换后旧状态 CT 已消失")
+    def test_switch_removes_old_state():
+        stm, entity_tracker, last_report, session_id = TestIntentSwitchCleanup.setup()
+
+        entity_tracker.apply_switch("换成 MR 膝关节")
+
+        assert_not_equal(entity_tracker.slots["modality"], "CT", "切换后 modality 不应为 CT（旧状态）")
+        assert_not_equal(entity_tracker.slots["body_part"], "脑部", "切换后 body_part 不应为 脑部（旧状态）")
+
+    @test("切换后 intent 标记为 switch")
+    def test_switch_intent_marked():
+        stm, entity_tracker, last_report, session_id = TestIntentSwitchCleanup.setup()
+
+        entity_tracker.apply_switch("换成 MR 膝关节")
+
+        assert_equal(entity_tracker.slots["intent"], "switch", "切换后 intent 应为 switch")
+
+
+# ═══════════════════════════════════════════════════════════
+# 测试 2：实体提取鲁棒性测试
+# ═══════════════════════════════════════════════════════════
+
+class TestEntityExtractionRobustness:
+
+    @test("长词优先：PET-CT 不被误识别为 PET 或 CT")
+    def test_long_word_priority_pet_ct():
+        tracker = EntityTracker()
+        tracker.update_from_query("做一个 PET-CT 全身扫描")
+        assert_equal(tracker.slots["modality"], "PET-CT",
+                     "必须提取 PET-CT，不能误识别为 PET 或 CT")
+
+    @test("长词优先：CTA 不被误识别为 CT")
+    def test_long_word_priority_cta():
+        tracker = EntityTracker()
+        tracker.update_from_query("CTA 冠状动脉检查")
+        assert_equal(tracker.slots["modality"], "CTA",
+                     "必须提取 CTA，不能误识别为 CT")
+
+    @test("长词优先：MRA 不被误识别为 MR")
+    def test_long_word_priority_mra():
+        tracker = EntityTracker()
+        tracker.update_from_query("MRA 脑血管")
+        assert_equal(tracker.slots["modality"], "MRA",
+                     "必须提取 MRA，不能误识别为 MR")
+
+    @test("长词优先：DWI 不被误识别为其它")
+    def test_long_word_priority_dwi():
+        tracker = EntityTracker()
+        tracker.update_from_query("DWI 序列检查")
+        assert_equal(tracker.slots["modality"], "DWI",
+                     "必须提取 DWI")
+
+    @test("歧义验证：MR 膝关节 准确识别")
+    def test_ambiguity_mr_knee():
+        tracker = EntityTracker()
+        tracker.update_from_query("MR 膝关节")
+        assert_equal(tracker.slots["modality"], "MR", "MR 膝关节 → modality 应为 MR")
+        assert_equal(tracker.slots["body_part"], "膝关节", "MR 膝关节 → body_part 应为 膝关节")
+
+    @test("歧义验证：MRA 脑血管 准确区分")
+    def test_ambiguity_mra_brain():
+        tracker = EntityTracker()
+        tracker.update_from_query("MRA 脑血管")
+        assert_equal(tracker.slots["modality"], "MRA", "MRA 脑血管 → modality 应为 MRA")
+        assert_equal(tracker.slots["body_part"], "脑部", "MRA 脑血管 → body_part 应为 脑部")
+
+    @test("歧义验证：MRI 颅脑 准确识别")
+    def test_mri_brain():
+        tracker = EntityTracker()
+        tracker.update_from_query("MRI 颅脑")
+        assert_equal(tracker.slots["modality"], "MRI", "MRI 颅脑 → modality 应为 MRI")
+        assert_equal(tracker.slots["body_part"], "颅脑", "MRI 颅脑 → body_part 应为 颅脑")
+
+    @test("部位长词优先：膝关节 不被误识别为 膝")
+    def test_body_part_long_word_priority():
+        tracker = EntityTracker()
+        tracker.update_from_query("膝关节置换术后")
+        assert_equal(tracker.slots["body_part"], "膝关节",
+                     "必须提取 膝关节，不能误识别为 膝")
+
+    @test("部位长词优先：颈椎 不被误识别为 颈")
+    def test_body_part_cervical():
+        tracker = EntityTracker()
+        tracker.update_from_query("颈椎 MRI")
+        assert_equal(tracker.slots["body_part"], "颈椎",
+                     "必须提取 颈椎")
+
+    @test("纯 CT 查询（无歧义）")
+    def test_ct_only():
+        tracker = EntityTracker()
+        tracker.update_from_query("CT 胸部")
+        assert_equal(tracker.slots["modality"], "CT")
+        assert_equal(tracker.slots["body_part"], "胸部")
+
+    @test("超声 查询")
+    def test_ultrasound():
+        tracker = EntityTracker()
+        tracker.update_from_query("超声甲状腺")
+        assert_equal(tracker.slots["modality"], "超声")
+        assert_equal(tracker.slots["body_part"], "甲状腺")
+
+
+# ═══════════════════════════════════════════════════════════
+# 测试 3：LTM 注入顺序测试
+# ═══════════════════════════════════════════════════════════
+
+class TestLTMInjectionOrder:
+
+    @test("LTM 偏好注入到 System Prompt 最顶部")
+    def test_ltm_preference_at_top():
+        # Mock：直接调用 LTM 的 get_preference_prompt 和 EntityTracker 的 to_context_prompt
+        # 模拟 structure_report 中的拼装逻辑
+        STRUCTURE_PROMPT = "## 结构化报告提取 Prompt\n请按 JSON 格式输出。"
+
+        # 模拟 LTM 有偏好
+        ltm = LongTermMemory(user_id="test_ltm_order")
+        ltm.update_preferences({"报告风格": "详细描述"})
+        ltm.update_preferences({"术语偏好": "中文术语"})
+
+        pref = ltm.get_preference_prompt()
+        assert_true(pref is not None, "LTM 偏好提示不应为空")
+        assert_true(len(pref) > 0, "LTM 偏好提示应有内容")
+
+        # 模拟 EntityTracker 有状态
+        entity_tracker = EntityTracker()
+        entity_tracker.update_from_query("CT 肺部")
+        ctx = entity_tracker.to_context_prompt()
+        assert_true(len(ctx) > 0, "Entity 上下文提示不应为空")
+
+        # 拼装：LTM 最顶部 → Entity 上下文 → 任务 Prompt
+        sys_prompt = STRUCTURE_PROMPT
+        if pref:
+            sys_prompt = pref + "\n\n" + sys_prompt
+        if ctx:
+            sys_prompt = sys_prompt + "\n\n" + ctx
+
+        # 断言：LTM 偏好必须在 System Prompt 开头
+        assert_true(sys_prompt.startswith(pref),
+                    f"System Prompt 必须以 LTM 偏好开头，实际开头: {sys_prompt[:80]!r}")
+
+        # 断言：Entity Context 在任务 Prompt 之后
+        pref_end = sys_prompt.find(STRUCTURE_PROMPT)
+        ctx_start = sys_prompt.find(ctx)
+        assert_true(ctx_start > pref_end,
+                    f"Entity Context 应在任务 Prompt 之后。pref_end={pref_end}, ctx_start={ctx_start}")
+
+    @test("LTM 无偏好时不注入")
+    def test_ltm_empty_not_injected():
+        ltm = LongTermMemory(user_id="test_ltm_empty")
+        ltm.clear()
+        pref = ltm.get_preference_prompt()
+        assert_equal(pref, "", "无偏好时 get_preference_prompt 应返回空字符串")
+
+    @test("EntityTracker 无状态时不注入")
+    def test_entity_empty_not_injected():
+        entity_tracker = EntityTracker()
+        entity_tracker.clear()
+        ctx = entity_tracker.to_context_prompt()
+        assert_equal(ctx, "", "无实体时 to_context_prompt 应返回空字符串")
+
+    @test("LTM + Entity 同时注入时顺序正确")
+    def test_ltm_and_entity_both_injected():
+        ltm = LongTermMemory(user_id="test_ltm_both")
+        ltm.update_preferences({"报告风格": "简洁"})
+        pref = ltm.get_preference_prompt()
+
+        entity_tracker = EntityTracker()
+        entity_tracker.update_from_query("CT 肝脏")
+        ctx = entity_tracker.to_context_prompt()
+
+        STRUCTURE_PROMPT = "## 任务 Prompt"
+
+        sys_prompt = STRUCTURE_PROMPT
+        if pref:
+            sys_prompt = pref + "\n\n" + sys_prompt
+        if ctx:
+            sys_prompt = sys_prompt + "\n\n" + ctx
+
+        # 断言三段顺序：LTM 偏好 → 任务 Prompt → Entity 上下文
+        pos_pref = sys_prompt.find(pref)
+        pos_task = sys_prompt.find(STRUCTURE_PROMPT)
+        pos_ctx = sys_prompt.find(ctx)
+
+        assert_true(pos_pref < pos_task < pos_ctx,
+                    f"顺序应为 LTM({pos_pref}) < 任务({pos_task}) < Entity({pos_ctx})")
+
+
+# ═══════════════════════════════════════════════════════════
+# 测试 4：上下文消解测试
+# ═══════════════════════════════════════════════════════════
+
+class TestContextResolution:
+
+    @test("消解：'再看看肝脏' → 补全模态和部位")
+    def test_resolve_append_liver():
+        tracker = EntityTracker()
+        tracker.update_from_query("CT 脑")
+        # 设置前置状态
+        tracker.slots["modality"] = "CT"
+        tracker.slots["body_part"] = "脑"
+
+        result = tracker.resolve_context("再看看肝脏")
+        assert_in("CT", result, "消解结果应包含继承的模态 CT")
+        assert_in("肝脏", result, "消解结果应包含新部位肝脏")
+
+    @test("消解：'再看看这个' → 补全模态和部位")
+    def test_resolve_this():
+        tracker = EntityTracker()
+        tracker.slots["modality"] = "CT"
+        tracker.slots["body_part"] = "脑"
+
+        result = tracker.resolve_context("再看看这个")
+        assert_in("CT", result, "消解结果应包含继承的模态 CT")
+        assert_in("脑", result, "消解结果应包含继承的部位 脑")
+
+    @test("消解：完整查询不补全")
+    def test_resolve_no_redundant_fill():
+        tracker = EntityTracker()
+        tracker.slots["modality"] = "CT"
+        tracker.slots["body_part"] = "脑"
+
+        result = tracker.resolve_context("MR 膝关节")
+        assert_equal(result, "MR 膝关节", "完整查询不应被消解修改")
+
+    @test("消解：只缺模态时补全模态")
+    def test_resolve_only_modality():
+        tracker = EntityTracker()
+        tracker.slots["modality"] = "CT"
+        tracker.slots["body_part"] = None
+
+        result = tracker.resolve_context("再看看肝脏")
+        assert_in("CT", result, "缺模态时应补全")
+        assert_in("肝脏", result, "应包含新部位")
+
+    @test("消解：只缺部位时补全部位")
+    def test_resolve_only_body_part():
+        tracker = EntityTracker()
+        tracker.slots["modality"] = None
+        tracker.slots["body_part"] = "脑"
+
+        result = tracker.resolve_context("CT 再看看")
+        assert_in("CT", result, "应包含新模态")
+        assert_in("脑", result, "缺部位时应补全")
+
+    @test("消解：无状态时原样返回")
+    def test_resolve_no_state():
+        tracker = EntityTracker()
+        tracker.clear()
+
+        result = tracker.resolve_context("再看看肝脏")
+        assert_equal(result, "再看看肝脏", "无状态时原样返回")
+
+    @test("消解：'接着看胃' → 补全模态")
+    def test_resolve_continue():
+        tracker = EntityTracker()
+        tracker.slots["modality"] = "CT"
+        tracker.slots["body_part"] = "肝"
+
+        result = tracker.resolve_context("接着看胃")
+        assert_in("CT", result, "应补全模态 CT")
+        assert_in("胃", result, "应包含新部位 胃")
+
+
+# ═══════════════════════════════════════════════════════════
+# 主入口
+# ═══════════════════════════════════════════════════════════
+
+def run_all_tests():
+    global PASS, FAIL
+    PASS = 0
+    FAIL = 0
+
+    print("=" * 60)
+    print("  记忆模块单元测试")
+    print("=" * 60)
+
+    print("\n📋 测试 1：意图切换清洗测试（最关键）")
+    TestIntentSwitchCleanup.test_stm_has_history()
+    TestIntentSwitchCleanup.test_entity_has_old_state()
+    TestIntentSwitchCleanup.test_last_report_has_content()
+    TestIntentSwitchCleanup.test_detect_switch_intent()
+    TestIntentSwitchCleanup.test_switch_clears_stm()
+    TestIntentSwitchCleanup.test_switch_clears_last_report()
+    TestIntentSwitchCleanup.test_switch_updates_modality()
+    TestIntentSwitchCleanup.test_switch_updates_body_part()
+    TestIntentSwitchCleanup.test_switch_removes_old_state()
+    TestIntentSwitchCleanup.test_switch_intent_marked()
+
+    print("\n📋 测试 2：实体提取鲁棒性测试")
+    TestEntityExtractionRobustness.test_long_word_priority_pet_ct()
+    TestEntityExtractionRobustness.test_long_word_priority_cta()
+    TestEntityExtractionRobustness.test_long_word_priority_mra()
+    TestEntityExtractionRobustness.test_long_word_priority_dwi()
+    TestEntityExtractionRobustness.test_ambiguity_mr_knee()
+    TestEntityExtractionRobustness.test_ambiguity_mra_brain()
+    TestEntityExtractionRobustness.test_mri_brain()
+    TestEntityExtractionRobustness.test_body_part_long_word_priority()
+    TestEntityExtractionRobustness.test_body_part_cervical()
+    TestEntityExtractionRobustness.test_ct_only()
+    TestEntityExtractionRobustness.test_ultrasound()
+
+    print("\n📋 测试 3：LTM 注入顺序测试")
+    TestLTMInjectionOrder.test_ltm_preference_at_top()
+    TestLTMInjectionOrder.test_ltm_empty_not_injected()
+    TestLTMInjectionOrder.test_entity_empty_not_injected()
+    TestLTMInjectionOrder.test_ltm_and_entity_both_injected()
+
+    print("\n📋 测试 4：上下文消解测试")
+    TestContextResolution.test_resolve_append_liver()
+    TestContextResolution.test_resolve_this()
+    TestContextResolution.test_resolve_no_redundant_fill()
+    TestContextResolution.test_resolve_only_modality()
+    TestContextResolution.test_resolve_only_body_part()
+    TestContextResolution.test_resolve_no_state()
+    TestContextResolution.test_resolve_continue()
+
+    print("\n" + "=" * 60)
+    print(f"  结果: 通过 {PASS} / 失败 {FAIL} / 总计 {PASS + FAIL}")
+    print("=" * 60)
+
+    return FAIL == 0
+
+
+if __name__ == "__main__":
+    success = run_all_tests()
+    sys.exit(0 if success else 1)

@@ -706,6 +706,22 @@ function handleStreamEvent(event, thinking) {
       finishThinking(thinking);
       addSystemMessage(`❌ ${event.message}`);
       break;
+
+    case "entity_update":
+      addThinkingStep(thinking, "📋", "实体更新", JSON.stringify(event.slots));
+      break;
+
+    case "intent_switch":
+      addThinkingStep(thinking, "🔄", "切换意图", event.message);
+      break;
+
+    case "memory_retrieval":
+      addMemoryRetrievalDetail(thinking, event);
+      break;
+
+    case "tool_executed":
+      addToolExecutedDetail(thinking, event);
+      break;
   }
 }
 
@@ -887,6 +903,86 @@ function addSystemMessage(text) {
   msg.className = "message system";
   msg.innerHTML = `<div class="bubble">${escapeHtml(text)}</div>`;
   chatContainer.appendChild(msg);
+  scrollToBottom();
+}
+
+// ========== 记忆检索详情 ==========
+
+function addMemoryRetrievalDetail(container, data) {
+  const body = container.querySelector(".thinking-body");
+  const step = document.createElement("div");
+  step.className = "thinking-step thinking-memory";
+
+  let html = `<span class="thinking-step-icon">🧠</span>
+    <span class="thinking-step-label">记忆检索 <span style="color:#888;font-size:11px">(基于 "${escapeHtml(data.query || '')}")</span></span>
+    <div class="thinking-detail-block">`;
+
+  if (data.ltm && data.ltm.length > 0) {
+    html += `<div class="thinking-highlight">📌 相关用户偏好 (LTM): ${data.ltm.length} 条</div>`;
+    data.ltm.forEach(function (item) {
+      html += `<div style="margin-left:12px;color:#7c3aed;">• ${escapeHtml(item)}</div>`;
+    });
+  } else {
+    html += `<div style="color:#888;">📌 相关用户偏好 (LTM): 无</div>`;
+  }
+
+  if (data.stm && data.stm.length > 0) {
+    html += `<div class="thinking-highlight" style="margin-top:8px;">💬 相关历史对话 (STM): ${data.stm.length} 条</div>`;
+    data.stm.forEach(function (item) {
+      var short = item.length > 80 ? item.slice(0, 80) + "..." : item;
+      html += `<div style="margin-left:12px;color:#059669;">• ${escapeHtml(short)}</div>`;
+    });
+  } else {
+    html += `<div style="color:#888;margin-top:8px;">💬 相关历史对话 (STM): 无</div>`;
+  }
+
+  html += `</div>`;
+  step.innerHTML = html;
+  body.appendChild(step);
+  scrollToBottom();
+}
+
+// ========== 工具执行详情 ==========
+
+function addToolExecutedDetail(container, data) {
+  const body = container.querySelector(".thinking-body");
+  const step = document.createElement("div");
+  step.className = "thinking-step thinking-tool";
+
+  var toolIcon = "🔧";
+  var toolLabel = data.tool;
+  if (data.tool === "rag_search") {
+    toolIcon = "🔍";
+    toolLabel = "RAG 检索";
+  } else if (data.tool === "edit_report") {
+    toolIcon = "✏️";
+    toolLabel = "编辑报告";
+  } else if (data.tool === "refine_report") {
+    toolIcon = "🔄";
+    toolLabel = "精炼报告";
+  }
+
+  var paramsHtml = "";
+  if (data.params) {
+    var keys = Object.keys(data.params);
+    keys.forEach(function (k) {
+      var v = data.params[k];
+      if (typeof v === "string" && v.length > 100) {
+        v = v.slice(0, 100) + "...";
+      }
+      paramsHtml += `<div style="margin-left:12px;color:#666;">• ${escapeHtml(k)}: ${escapeHtml(String(v))}</div>`;
+    });
+  }
+
+  step.innerHTML = `
+    <span class="thinking-step-icon">${toolIcon}</span>
+    <span class="thinking-step-label">工具执行: ${toolLabel}</span>
+    <div class="thinking-detail-block">
+      ${paramsHtml}
+      <div class="thinking-highlight">结果长度: ${data.result_length} 字符 ${data.is_final ? "✅ 最终结果" : "⏳ 继续处理"}</div>
+    </div>
+  `;
+  body.appendChild(step);
   scrollToBottom();
 }
 

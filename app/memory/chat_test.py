@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from memory.entity_tracker import EntityTracker
 from memory.short_term import ShortTermMemory
 from memory.long_term import LongTermMemory
 
@@ -92,6 +93,7 @@ def summarize_fn(messages: list[dict]) -> str:
 def main():
     debug = "--debug" in sys.argv
     stm = ShortTermMemory(max_rounds=5, summarize_fn=summarize_fn)
+    entity_tracker = EntityTracker()
     ltm = LongTermMemory(user_id=SESSION_ID)
 
     load_dotenv(ENV_PATH)
@@ -119,14 +121,14 @@ def main():
             user_input = input("你: ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\n再见！")
-            ltm.on_session_end(stm, SESSION_ID)
+            ltm.on_session_end(stm, SESSION_ID, entity_tracker)
             break
 
         if not user_input:
             continue
         if user_input.lower() in ("exit", "quit"):
             print("再见！")
-            ltm.on_session_end(stm, SESSION_ID)
+            ltm.on_session_end(stm, SESSION_ID, entity_tracker)
             ltm.close()
             break
         if user_input.lower() == "clear":
@@ -157,7 +159,7 @@ def main():
             info = stm.session_info(SESSION_ID)
             print(f"📊 短期记忆: {info['session_id']}")
             print(f"   轮次: {info['turns']}/{info['max_rounds']} (总计: {info['total_turns']})")
-            print(f"   实体: {info['entities']}")
+            print(f"   实体槽位: {entity_tracker.slots}")
             print(f"   摘要: {info['summary_count']} 条")
             summaries = stm.get_summaries(SESSION_ID)
             if summaries:
@@ -174,7 +176,8 @@ def main():
             print()
             continue
 
-        enhanced = stm.resolve_context(SESSION_ID, user_input)
+        entity_tracker.update_from_query(user_input)
+        enhanced = entity_tracker.resolve_context(user_input)
         if debug and enhanced != user_input:
             print(f"🔗 上下文消解: '{user_input}' → '{enhanced}'")
 
@@ -188,7 +191,7 @@ def main():
 
         if debug:
             info = stm.session_info(SESSION_ID)
-            print(f"📊 短期记忆: {info['turns']}/{info['max_rounds']} 轮 | 实体: {info['entities']}")
+            print(f"📊 短期记忆: {info['turns']}/{info['max_rounds']} 轮 | 实体槽位: {entity_tracker.slots}")
             if pref_prompt:
                 print(f"📊 长期记忆: 已注入偏好提示")
 
@@ -196,7 +199,7 @@ def main():
         try:
             reply = chat_stream(messages)
             stm.add_turn(SESSION_ID, user_input, reply)
-            ltm.sync_from_short_term(stm, SESSION_ID)
+            ltm.sync_from_short_term(stm, SESSION_ID, entity_tracker)
         except Exception as e:
             print(f"\n（出错: {e}）")
             continue

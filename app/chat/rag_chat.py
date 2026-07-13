@@ -26,6 +26,7 @@ import requests
 from dotenv import load_dotenv
 from pymilvus import MilvusClient
 
+from memory.entity_tracker import EntityTracker
 from memory.short_term import ShortTermMemory
 from memory.long_term import LongTermMemory
 from rag.rerank import rerank_documents, get_rerank_config
@@ -280,7 +281,7 @@ def generate_merged_report(accumulated_searches, base_sys_prompt):
     return chat_stream(messages, max_tokens=4096, temperature=0.3, debug=True)
 
 
-def run_react_with_events(query, session_id, stm, ltm, client, accumulated_searches, last_report, _emit):
+def run_react_with_events(query, session_id, stm, entity_tracker, ltm, client, accumulated_searches, last_report, _emit):
     """Web 模式的 ReAct 管道，通过 _emit 发送 SSE 事件"""
 
     accumulated_searches.clear()
@@ -293,7 +294,9 @@ def run_react_with_events(query, session_id, stm, ltm, client, accumulated_searc
     original_query = query
     query = standardize_query(query)
 
-    enhanced = stm.resolve_context(session_id, query)
+    # 实体提取 + 上下文消解
+    entity_tracker.update_from_query(query)
+    enhanced = entity_tracker.resolve_context(query)
     if enhanced != query:
         _emit("context_resolve", {"original": query, "resolved": enhanced})
     query = enhanced
@@ -444,9 +447,11 @@ def web_main(port=8000):
             client = MilvusClient(uri=DB_PATH)
             client.load_collection(COLLECTION_NAME)
             stm = ShortTermMemory(max_rounds=5, summarize_fn=summarize_fn)
+            entity_tracker = EntityTracker(llm_chat_fn=chat_stream)
             ltm = LongTermMemory(user_id=session_id)
             _web_sessions[session_id] = {
                 "stm": stm,
+                "entity_tracker": entity_tracker,
                 "ltm": ltm,
                 "client": client,
                 "accumulated_searches": [],
@@ -481,7 +486,7 @@ def web_main(port=8000):
                 try:
                     run_react_with_events(
                         query, session_id,
-                        session["stm"], session["ltm"], session["client"],
+                        session["stm"], session["entity_tracker"], session["ltm"], session["client"],
                         session["accumulated_searches"],
                         session["last_report"],
                         _emit_sse,
@@ -534,7 +539,9 @@ def web_main(port=8000):
         if session_id in _web_sessions:
             session = _web_sessions[session_id]
             session["stm"].clear(session_id)
+            session["entity_tracker"].clear()
             session["accumulated_searches"].clear()
+            session["last_report"] = [""]
         return {"status": "ok"}
 
     @app.get("/api/info")
@@ -543,9 +550,10 @@ def web_main(port=8000):
             return {"current_turns": 0}
         session = _web_sessions[session_id]
         session_info = session["stm"].session_info(session_id)
+        entity = session["entity_tracker"]
         return {
             "current_turns": session_info.get("current_turns", 0),
-            "entity_count": session_info.get("entity_count", 0),
+            "entity_slots": entity.slots,
             "accumulated_searches": len(session["accumulated_searches"]),
         }
 
@@ -585,6 +593,7 @@ def main():
         sys.exit(1)
 
     stm = ShortTermMemory(max_rounds=5, summarize_fn=summarize_fn)
+    entity_tracker = EntityTracker(llm_chat_fn=chat_stream)
     ltm = LongTermMemory(user_id=SESSION_ID)
 
     client = MilvusClient(uri=DB_PATH)
@@ -627,6 +636,7 @@ def main():
 
                 if user_input.lower() == "clear":
                     stm.clear(SESSION_ID)
+                    entity_tracker.clear()
                     accumulated_searches.clear()
                     print("🧹 会话已清空\n")
                     continue
@@ -634,10 +644,11 @@ def main():
                 if user_input.lower() == "info":
                     print(f"📊 记忆状态:")
                     session_info = stm.session_info(SESSION_ID)
-                    print(f"   短期记忆: {session_info['current_turns']} 轮, {session_info['entity_count']} 个实体, {session_info['summary_count']} 条摘要")
+                    print(f"   短期记忆: {session_info['current_turns']} 轮, {session_info['summary_count']} 条摘要")
+                    print(f"   实体槽位: {entity_tracker.slots}")
                     ltm_info = ltm.get_stats()
                     print(f"   长期记忆: {ltm_info['total_sessions']} 次会话, {ltm_info['total_turns']} 轮")
-                    entities = stm.get_entities(SESSION_ID)
+                    entities = entity_tracker.slots
                     if entities:
                         print(f"   当前实体: {entities}")
                     summaries = stm.get_summaries(SESSION_ID)
@@ -661,7 +672,8 @@ def main():
                 original_query = query
                 query = standardize_query(query)
 
-                enhanced = stm.resolve_context(SESSION_ID, query)
+                entity_tracker.update_from_query(query)
+                enhanced = entity_tracker.resolve_context(query)
                 if debug and enhanced != query:
                     print(f"🔗 上下文消解: '{query}' → '{enhanced}'")
                 query = enhanced
@@ -790,7 +802,7 @@ def main():
                 finally:
                     if final_answer:
                         stm.add_turn(SESSION_ID, query, final_answer)
-                        ltm.sync_from_short_term(stm, SESSION_ID)
+                        ltm.sync_from_short_term(stm, SESSION_ID, entity_tracker)
 
                 print()
 
@@ -799,7 +811,7 @@ def main():
                 break
 
     finally:
-        ltm.on_session_end(stm, SESSION_ID)
+        ltm.on_session_end(stm, SESSION_ID, entity_tracker)
         ltm.close()
         client.close()
 

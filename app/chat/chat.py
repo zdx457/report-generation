@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from prompt import load_prompt
 
+from memory.entity_tracker import EntityTracker
 from memory.short_term import ShortTermMemory
 from memory.long_term import LongTermMemory
 
@@ -93,6 +94,7 @@ def main():
     debug = "--debug" in sys.argv
 
     stm = ShortTermMemory(max_rounds=5, summarize_fn=summarize_fn)
+    entity_tracker = EntityTracker(llm_chat_fn=chat_stream)
     ltm = LongTermMemory(user_id=SESSION_ID)
 
     print("=" * 60)
@@ -113,7 +115,7 @@ def main():
             user_input = input("你: ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\n再见！")
-            ltm.on_session_end(stm, SESSION_ID)
+            ltm.on_session_end(stm, SESSION_ID, entity_tracker)
             ltm.close()
             break
 
@@ -122,24 +124,23 @@ def main():
 
         if user_input.lower() in ("exit", "quit"):
             print("再见！")
-            ltm.on_session_end(stm, SESSION_ID)
+            ltm.on_session_end(stm, SESSION_ID, entity_tracker)
             ltm.close()
             break
 
         if user_input.lower() == "clear":
             stm.clear(SESSION_ID)
+            entity_tracker.clear()
             print("🧹 会话已清空\n")
             continue
 
         if user_input.lower() == "info":
             print(f"📊 记忆状态:")
             session_info = stm.session_info(SESSION_ID)
-            print(f"   短期记忆: {session_info['current_turns']} 轮, {session_info['entity_count']} 个实体, {session_info['summary_count']} 条摘要")
+            print(f"   短期记忆: {session_info['current_turns']} 轮, {session_info['summary_count']} 条摘要")
+            print(f"   实体槽位: {entity_tracker.slots}")
             ltm_info = ltm.get_stats()
             print(f"   长期记忆: {ltm_info['total_sessions']} 次会话, {ltm_info['total_turns']} 轮")
-            entities = stm.get_entities(SESSION_ID)
-            if entities:
-                print(f"   当前实体: {entities}")
             summaries = stm.get_summaries(SESSION_ID)
             if summaries:
                 print(f"   历史摘要:")
@@ -149,7 +150,8 @@ def main():
             continue
 
         query = user_input
-        enhanced = stm.resolve_context(SESSION_ID, query)
+        entity_tracker.update_from_query(query)
+        enhanced = entity_tracker.resolve_context(query)
         if debug and enhanced != query:
             print(f"🔗 上下文消解: '{query}' → '{enhanced}'")
 
@@ -244,7 +246,7 @@ def main():
 
         print()
         stm.add_turn(SESSION_ID, query, final_answer)
-        ltm.sync_from_short_term(stm, SESSION_ID)
+        ltm.sync_from_short_term(stm, SESSION_ID, entity_tracker)
 
 
 if __name__ == "__main__":
