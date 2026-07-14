@@ -504,7 +504,7 @@ function createEmptyState() {
   return div;
 }
 
-async function sendMessage() {
+async function sendMessage(selectedDiagnosis) {
   const query = userInput.value.trim();
   if (!query || isProcessing) return;
 
@@ -542,6 +542,7 @@ async function sendMessage() {
       body: JSON.stringify({
         query: query,
         session_id: SESSION_ID,
+        selected_diagnosis: selectedDiagnosis || null,
       }),
       signal: chatAbortController.signal,
     });
@@ -721,6 +722,12 @@ function handleStreamEvent(event, thinking) {
 
     case "tool_executed":
       addToolExecutedDetail(thinking, event);
+      break;
+
+    case "ambiguous":
+      console.log("[DEBUG] ambiguous 事件触发, options数量=", (event.options || []).length);
+      finishThinking(thinking);
+      addAmbiguousOptions(event);
       break;
   }
 }
@@ -985,6 +992,43 @@ function addToolExecutedDetail(container, data) {
   body.appendChild(step);
   scrollToBottom();
 }
+
+// ========== 歧义选项 ==========
+
+function addAmbiguousOptions(data) {
+  console.log("[DEBUG] addAmbiguousOptions 被调用, options=", data.options);
+  var question = data.question || "请选择：";
+  var options = data.options || [];
+  var scores = data.scores || [];
+
+  var bubble = document.createElement("div");
+  bubble.className = "message assistant";
+
+  var optionsHtml = (options || []).map(function (opt, i) {
+    var scoreText = scores[i] ? ' <span style="color:#999;font-size:0.8em;">(' + (scores[i] * 100).toFixed(1) + '%)</span>' : '';
+    return '<button class="ambiguity-option" onclick="selectAmbiguityOption(\'' + escapeHtml(opt) + '\')" style="display:block;margin:4px 0;padding:8px 16px;border:1px solid #667eea;border-radius:8px;background:#f0f0ff;cursor:pointer;text-align:left;width:100%;">' + (i + 1) + '. ' + escapeHtml(opt) + scoreText + '</button>';
+  }).join("");
+
+  bubble.innerHTML = `
+    <div class="message-content">
+      <p>${escapeHtml(question)}</p>
+      <div>${optionsHtml}</div>
+      <p style="color:#999;font-size:0.8em;margin-top:8px;">点击选择，或直接输入完整描述</p>
+    </div>
+  `;
+  chatContainer.appendChild(bubble);
+  scrollToBottom();
+}
+
+window.selectAmbiguityOption = function (option) {
+  var input = document.getElementById("userInput");
+  if (input) {
+    cancelCurrentRequest();
+    setProcessing(false);
+    input.value = option;
+    sendMessage(option);
+  }
+};
 
 // ========== 工具函数 ==========
 

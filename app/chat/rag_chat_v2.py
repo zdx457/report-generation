@@ -27,6 +27,9 @@ from typing import Optional, Callable, Any
 
 import yaml
 import requests
+
+# 全局歧义缓存，跨请求存活（按 session_id 索引）
+_ambiguity_cache = {}
 from dotenv import load_dotenv
 from pymilvus import MilvusClient
 
@@ -125,7 +128,7 @@ def get_embedding(text):
 
 
 def _estimate_tokens(messages):
-    total_chars = sum(len(msg.get("content", "")) for msg in messages)
+    total_chars = sum(len(msg.get("content", "") or "") for msg in messages)
     return total_chars, total_chars // 2
 
 
@@ -191,7 +194,7 @@ def rerank_with_retry(query, documents, top_n=3):
 
 
 def search_reports(query, top_k=RAG_TOP_K, rerank_top_k=RERANK_TOP_K, client=None, _emit=None):
-    """RAG 检索：多路召回 + Rerank，返回格式化文本"""
+    """RAG 检索：多路召回 + Rerank，返回 (格式化文本, reranked_entities)"""
     if rerank_top_k > top_k:
         rerank_top_k = top_k
 
@@ -201,7 +204,7 @@ def search_reports(query, top_k=RAG_TOP_K, rerank_top_k=RERANK_TOP_K, client=Non
     candidates, recall_details = multi_recall(query_vec, keywords, top_k=top_k, client=client, return_details=True)
 
     if not candidates:
-        return "未检索到相关报告。"
+        return "未检索到相关报告。", []
 
     if _emit:
         vec_results = recall_details.get("vector", [])
@@ -251,7 +254,7 @@ def search_reports(query, top_k=RAG_TOP_K, rerank_top_k=RERANK_TOP_K, client=Non
         score = entity.get("_rerank_score", 0)
         parts.append(f"### 参考{i}（Rerank分数: {score:.4f}）\n{entity['text']}\n")
 
-    return "\n".join(parts)
+    return "\n".join(parts), reranked_entities
 
 
 # =============================================================================
@@ -652,7 +655,7 @@ def json_to_display(report_json):
 # 主流程：run_pipeline（Tool Calling 架构）
 # =============================================================================
 def _build_tool_registry(
-    ltm, entity_tracker, client, last_report, _emit,
+    ltm, entity_tracker, client, last_report, _emit, selected_diagnosis=None, last_ambiguity=None,
 ):
     """构建并注册工具到 ToolRegistry。
 
@@ -689,6 +692,8 @@ def _build_tool_registry(
         search_reports_fn=_search_reports_fn,
         _emit_fn=_emit,
         last_report=last_report,
+        selected_diagnosis=selected_diagnosis,
+        last_ambiguity=last_ambiguity,
     )
     registry.register("rag_search", RAG_SEARCH_SCHEMA, rag_handler)
 
@@ -711,7 +716,7 @@ def _build_tool_registry(
     return registry
 
 
-def run_pipeline(query, session_id, stm, entity_tracker, ltm, client, last_report, _emit):
+def run_pipeline(query, session_id, stm, entity_tracker, ltm, client, last_report, _emit, selected_diagnosis=None, last_ambiguity=None):
     """Tool Calling 架构主流程
 
     记忆模块集成点：
@@ -720,36 +725,45 @@ def run_pipeline(query, session_id, stm, entity_tracker, ltm, client, last_repor
     3. Phase 2 (Tool Calling): LLM 自主决定调用工具或直接回复
     4. Phase 3 (Post-LLM): 更新 STM，记录用户偏好
     """
-    logger.info(f"── run_pipeline 开始: session={session_id}, query={query[:50]}...")
+    logger.info(f"── run_pipeline 开始: session={session_id}, query={query[:50]}..., selected_diagnosis={selected_diagnosis}")
 
     # ── Phase 1: 输入处理 ──
-    # 1. 实体提取：从用户输入提取实体更新槽位
-    changes = entity_tracker.update_from_query(query)
-    if changes:
-        logger.info(f"实体更新: {changes}")
-        _emit("entity_update", {"changes": changes, "slots": entity_tracker.slots})
+    # 如果用户点击了歧义选项，跳过实体提取/意图检测/上下文消解，
+    # 保留上一轮的 modality/body_part 槽位，确保缓存命中
+    if selected_diagnosis:
+        logger.info("run_pipeline: 用户通过歧义选项选择诊断，跳过 Phase 1，保留槽位")
+        # 明确告知 LLM：用户已选择诊断，请调用 rag_search 生成报告
+        enhanced = f"用户选择了诊断：{query}。请使用 rag_search 工具生成该诊断的结构化报告。"
+        _emit("intent", {"intent": "TOOL_CALL"})
+    else:
+        # 1. 实体提取：从用户输入提取实体更新槽位
+        changes = entity_tracker.update_from_query(query)
+        if changes:
+            logger.info(f"实体更新: {changes}")
+            _emit("entity_update", {"changes": changes, "slots": entity_tracker.slots})
 
-    # 2. 意图检测：new_session / append / switch
-    detected_intent = entity_tracker.detect_intent(query)
-    logger.info(f"实体意图: {detected_intent}, slots: {entity_tracker.slots}")
+        # 2. 意图检测：new_session / append / switch
+        detected_intent = entity_tracker.detect_intent(query)
+        logger.info(f"实体意图: {detected_intent}, slots: {entity_tracker.slots}")
 
-    # 切换意图：必须彻底清空，严禁旧病灶残留
-    if detected_intent == "switch":
-        logger.info("检测到切换意图，清空会话上下文")
-        stm.clear(session_id)
-        if last_report:
-            last_report[0] = ""
-        entity_tracker.apply_switch(query)
-        _emit("intent_switch", {"message": "已清空旧上下文，开始新检查"})
+        # 切换意图：必须彻底清空，严禁旧病灶残留
+        if detected_intent == "switch":
+            logger.info("检测到切换意图，清空会话上下文")
+            stm.clear(session_id)
+            if last_report:
+                last_report[0] = ""
+            entity_tracker.apply_switch(query)
+            _emit("intent_switch", {"message": "已清空旧上下文，开始新检查"})
 
-    # 3. 上下文消解：补全省略信息
-    enhanced = entity_tracker.resolve_context(query)
-    enhanced = standardize_query(enhanced)
-    if enhanced != query:
-        logger.info(f"上下文消解: '{query}' → '{enhanced}'")
-        _emit("context_resolve", {"original": query, "resolved": enhanced})
+        # 3. 上下文消解：补全省略信息
+        enhanced = entity_tracker.resolve_context(query)
+        enhanced = standardize_query(enhanced)
+        if enhanced != query:
+            logger.info(f"上下文消解: '{query}' → '{enhanced}'")
+            _emit("context_resolve", {"original": query, "resolved": enhanced})
 
-    if needs_rewrite(enhanced):
+    # 如果用户通过歧义选项选择诊断，跳过查询改写
+    if not selected_diagnosis and needs_rewrite(enhanced):
         original = enhanced
         rewritten = rewrite_query(enhanced)
         if rewritten and rewritten != enhanced:
@@ -761,7 +775,7 @@ def run_pipeline(query, session_id, stm, entity_tracker, ltm, client, last_repor
 
     # ── Phase 2: Tool Calling 主循环 ──
     # 构建工具注册中心
-    registry = _build_tool_registry(ltm, entity_tracker, client, last_report, _emit)
+    registry = _build_tool_registry(ltm, entity_tracker, client, last_report, _emit, selected_diagnosis=selected_diagnosis, last_ambiguity=last_ambiguity)
     tools_schema = registry.get_tools_schema()
     logger.info(f"已注册工具: {list(registry._tools.keys())}")
 
@@ -916,6 +930,28 @@ def run_pipeline(query, session_id, stm, entity_tracker, ltm, client, last_repor
     # 直接将报告内容发送给前端，避免 LLM 二次总结引入幻觉或改变医学术语。
     final_content = None
 
+    # ── 歧义检测：检查工具结果中是否有 ambiguous 状态 ──
+    for tool_id, result in tool_results:
+        if not result.is_final:
+            continue
+        try:
+            result_json = json.loads(result.content)
+            if isinstance(result_json, dict) and result_json.get("status") == "ambiguous":
+                if _emit:
+                    _emit("ambiguous", {
+                        "question": result_json.get("question", ""),
+                        "options": result_json.get("options", []),
+                        "scores": result_json.get("scores", []),
+                    })
+                display = f"🔍 {result_json['question']}\n\n" + "\n".join(
+                    f"{i+1}. {opt}" for i, opt in enumerate(result_json.get("options", []))
+                )
+                stm.add_turn(session_id, query, display)
+                logger.info("── run_pipeline 完成: 歧义追问, options=%s", result_json.get("options"))
+                return display
+        except Exception:
+            logger.error("解析工具结果 ambiguous 状态失败", exc_info=True)
+
     if any_final:
         logger.info("工具返回 is_final=True，跳过二次 LLM 调用，直接发送报告")
         if _emit:
@@ -930,7 +966,7 @@ def run_pipeline(query, session_id, stm, entity_tracker, ltm, client, last_repor
                 if isinstance(result_json, dict) and ("results" in result_json or "影像学表现" in result_json or "诊断意见" in result_json):
                     last_report[0] = result.content
                     logger.info(f"已保存 last_report (长度: {len(result.content)})")
-                    break
+                    # 不 break，继续循环，后面发送循环也需要遍历
             except Exception as e:
                 logger.warning("保存 last_report 失败", exc_info=True)
 
@@ -940,6 +976,7 @@ def run_pipeline(query, session_id, stm, entity_tracker, ltm, client, last_repor
                 continue
             try:
                 result_json = json.loads(result.content)
+                logger.info(f"── 检查工具结果: keys={list(result_json.keys()) if isinstance(result_json, dict) else type(result_json)}")
                 if isinstance(result_json, dict) and "error" not in result_json:
                     if "results" in result_json or "影像学表现" in result_json or "诊断意见" in result_json:
                         display = json_to_display(result_json)
@@ -947,6 +984,10 @@ def run_pipeline(query, session_id, stm, entity_tracker, ltm, client, last_repor
                         stm.add_turn(session_id, query, display)
                         logger.info(f"── run_pipeline 完成: is_final 报告直接发送, display长度={len(display)}")
                         return display
+                    else:
+                        logger.warning(f"── 工具结果不包含报告字段: {list(result_json.keys())}")
+                else:
+                    logger.warning(f"── 工具结果包含 error 或不是 dict: {result_json.get('error', '') if isinstance(result_json, dict) else type(result_json)}")
             except Exception:
                 logger.error("解析工具结果失败", exc_info=True)
 
@@ -1061,12 +1102,17 @@ def web_main(port=8000):
             # 恢复 last_report
             last_report = [session_data["state"]["last_report"]]
 
+            # 恢复歧义缓存（跨请求存活）
+            cached = _ambiguity_cache.get(session_id)
+            last_ambiguity = [cached] if cached else [None]
+
             return {
                 "stm": stm,
                 "entity_tracker": entity_tracker,
                 "ltm": ltm,
                 "client": client,
                 "last_report": last_report,
+                "last_ambiguity": last_ambiguity,
             }
         else:
             # ── 创建新会话 ──
@@ -1085,6 +1131,7 @@ def web_main(port=8000):
                 "ltm": ltm,
                 "client": client,
                 "last_report": [""],
+                "last_ambiguity": [None],
             }
 
     @app.post("/api/chat")
@@ -1092,15 +1139,17 @@ def web_main(port=8000):
         body = await request.json()
         query = body.get("query", "").strip()
         session_id = body.get("session_id", "default")
+        selected_diagnosis = body.get("selected_diagnosis", None)
 
         if not query:
             return {"error": "query 不能为空"}
 
-        logger.info(f"收到查询: session={session_id}, query={query[:50]}...")
+        logger.info(f"收到查询: session={session_id}, query={query[:50]}..., selected_diagnosis={selected_diagnosis}")
         session = _get_or_create_session(session_id)
         stm = session["stm"]
         entity_tracker = session["entity_tracker"]
         last_report = session["last_report"]
+        last_ambiguity = session["last_ambiguity"]
 
         async def event_stream():
             loop = asyncio.get_event_loop()
@@ -1108,7 +1157,9 @@ def web_main(port=8000):
 
             def _emit_sse(event_type, data):
                 try:
-                    event_queue.put_nowait(json.dumps({"type": event_type, **data}, ensure_ascii=False))
+                    payload = json.dumps({"type": event_type, **data}, ensure_ascii=False)
+                    logger.info(f"── _emit_sse: type={event_type}, len={len(payload)}")
+                    event_queue.put_nowait(payload)
                 except Exception:
                     logger.warning("SSE事件入队失败", exc_info=True)
 
@@ -1118,15 +1169,29 @@ def web_main(port=8000):
                     info_before = stm.session_info(session_id)
                     turn_index = info_before.get("total_turns", 0)
 
+                    # 记录本轮前缓存是否已存在，用于判断是否清除
+                    cache_existed_before = session_id in _ambiguity_cache
+
                     result = run_pipeline(
                         query, session_id,
                         stm, entity_tracker, session["ltm"], session["client"],
                         last_report,
                         _emit_sse,
+                        selected_diagnosis=selected_diagnosis,
+                        last_ambiguity=last_ambiguity,
                     )
 
                     if result:
                         logger.info(f"run_pipeline 完成: result长度={len(result)}")
+
+                    # ── 同步歧义缓存到全局 dict（跨请求存活）──
+                    if last_ambiguity[0] is not None:
+                        _ambiguity_cache[session_id] = last_ambiguity[0]
+                        logger.info(f"歧义缓存已同步到全局: session={session_id}")
+                    # 只有缓存之前就存在 + 本轮是新查询（非点击）时才清除
+                    if cache_existed_before and not selected_diagnosis:
+                        _ambiguity_cache.pop(session_id, None)
+                        logger.info(f"歧义缓存已清除（新查询）: session={session_id}")
 
                     # ── 持久化：保存对话记录和会话状态 ──
                     try:
@@ -1151,10 +1216,18 @@ def web_main(port=8000):
                 try:
                     event = await loop.run_in_executor(None, event_queue.get, True, 120)
                     if event == "[DONE]":
+                        logger.info("── event_stream(chat): 发送 [DONE]")
                         yield "data: [DONE]\n\n"
                         break
+                    try:
+                        evt = json.loads(event)
+                        evt_type = evt.get("type", "?")
+                        logger.info(f"── event_stream(chat): 发送 type={evt_type}, len={len(event)}")
+                    except Exception:
+                        logger.info(f"── event_stream(chat): 发送 raw, len={len(event)}")
                     yield f"data: {event}\n\n"
                 except queue.Empty:
+                    logger.info("── event_stream(chat): 队列超时，退出")
                     break
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")

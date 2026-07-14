@@ -23,8 +23,8 @@ reranks:
   model: Qwen/Qwen3-VL-Reranker-8B
   api_key: ''
 retrieval:
-  rag_top_k: 10
-  rerank_top_k: 3
+  rag_top_k: 20
+  rerank_top_k: 10
   collection_name: report_slices
   db_path: ./app/data_pipeline/milvus_lite.db
 short_term_memory:

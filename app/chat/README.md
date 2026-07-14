@@ -48,7 +48,8 @@ chat/
 [Phase 1] 预处理
     ├ 实体提取（LLM + 规则双引擎）
     ├ 意图检测（new_session / append / switch）
-    └ 上下文消解（补全省略信息）
+    ├ 上下文消解（补全省略信息）
+    └ ★ 如果 selected_diagnosis 非空（用户点击歧义按钮）→ 跳过 Phase 1，保留 modality/body_part
     │
     ▼
 [Phase 2] Tool Calling 主循环
@@ -62,18 +63,19 @@ chat/
     ├── 执行 rag_search 工具
     │     ├ 多路召回（向量 + 元数据 + 关键词）
     │     ├ Rerank 精排
+    │     ├ 歧义检测：top-N 分数接近且诊断多样 → 追问用户
+    │     │   ├ 缓存检索结果 + Rerank 结果（全局 dict，跨请求存活）
+    │     │   └ _emit("ambiguous") → 前端按钮选择
+    │     ├ ★ 如果 selected_diagnosis 非空（用户点击按钮）：
+    │     │   ├ 命中缓存 → 跳过检索和 Rerank
+    │     │   ├ _filter_by_selected_diagnosis() → 过滤只保留匹配的诊断
+    │     │   └ _rebuild_search_result() → 重建检索文本
     │     ├ 注入 LTM 偏好 + Entity 上下文
     │     └ LLM 生成结构化报告 JSON
     │
     ├── 追加 role:tool 消息到 messages
     │
-    └── chat_with_tools(messages, tools=None) → 生成最终回复
-    │
-    ▼
-[Phase 3] 后处理
-    ├ 更新 last_report
-    ├ STM 记录对话
-    └ SSE 推送报告到前端
+    └── 报告类结果（_is_final=true）→ 跳过二次 LLM，直接发送报告
 ```
 
 ### 2. 三个工具
