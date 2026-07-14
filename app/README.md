@@ -7,7 +7,7 @@
 - **Tool Calling 架构**：LLM 自主决策调用哪个工具（`rag_search` / `edit_report` / `refine_report`），替代硬编码意图分类，架构更灵活可扩展
 - **PromptBuilder 统一拼装**：消除 `rag_tool.py`、`refine_tool.py`、`rag_chat_v2.py` 中重复的 Prompt 拼装代码，LTM 偏好 + Entity 上下文 + 模板 + Last Report 由 `PromptBuilder.build()` 统一管理，拼接顺序和 reasoning 去除逻辑单点维护
 - **三层记忆架构**：Entity Tracker（实体槽位）+ STM（短期记忆）+ LTM（长期偏好），独立解耦
-- **LLM 实体提取**：双引擎机制（LLM JSON 结构化提取优先级 + 规则兜底），关键词按长度降序匹配
+- **LLM 实体提取**：双引擎机制（LLM JSON 结构化提取优先级 + 规则兜底），关键词按长度降序匹配，支持多部位（如 `CT 肝脏和胆囊` → `body_part: ["肝脏", "胆囊"]`）
 - **意图切换清洗**：切换检查部位时强制清空 STM 和 last_report，杜绝旧病灶残留
 - **多轮对话**：上下文消解 + 指代消解，继承检查类型，多轮报告自动合并去重
 - **短期记忆**：可配置轮数（前端配置）+ 对话摘要，可通过前端面板查看
@@ -280,12 +280,13 @@ python app/chat/rag_chat_v2.py
 
 ### 实体提取（Entity Tracker）
 
-| 机制             | 说明                                                                      |
-| ---------------- | ------------------------------------------------------------------------- |
-| LLM 提取（优先） | 调用 LLM 返回 JSON `{"modality": "CT", "body_part": "脑部"}`，精准识别    |
-| 规则兜底         | LLM 不可用时按关键词长度降序匹配（PET-CT > CT > T），避免缩写歧义         |
-| 上下文消解       | 省略主语时自动补全："再看看肝脏" → "CT 肝脏再看看肝脏"                    |
-| 意图检测         | 粗粒度判断：new_session / append / switch（切换时清空 STM + last_report） |
+| 机制             | 说明                                                                                                                                                                               |
+| ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 实体槽位         | `modality`（检查类型）、`body_part`（检查部位，**列表存储，支持多个**）、`clinical_history`（病史/症状）、`diagnosis`（已确认诊断列表）、`intent`（new_session / append / switch） |
+| LLM 提取（优先） | 调用 LLM 返回 JSON `{"modality": "CT", "body_part": ["脑部", "颈部"]}`，支持数组输出多部位                                                                                         |
+| 规则兜底         | LLM 不可用时按关键词长度降序匹配（PET-CT > CT > T），所有匹配部位追加到列表，长词优先去重（"膝关节"已匹配则跳过"膝"）                                                              |
+| 上下文消解       | 省略主语时自动补全："再看看肝脏" → "CT 脑部 肝脏 再看看肝脏"（多部位拼接）                                                                                                         |
+| 意图检测         | 粗粒度判断：new_session / append / switch（切换时清空 STM + last_report）                                                                                                          |
 
 ### Tool Calling 机制
 
@@ -557,3 +558,36 @@ python app/test/eval_rerank_compare.py -n 50 -k 10 -r 5    # 抽 50 条，向量
 - 写入失败仅记录 Warning 日志，不阻断 Agent 主流程
 - `load_session()` 返回 `None` 时自动创建新会话，兼容旧数据
 - JSON 反序列化失败时回退为空字典 `{}`，不崩溃
+
+## 前端对话存储（localStorage）
+
+前端使用浏览器 localStorage 存储对话的完整 HTML（含思考过程），实现**刷新页面后无需调 API 即可恢复 UI**。
+
+| 存储键                | 说明                                                                   |
+| --------------------- | ---------------------------------------------------------------------- |
+| `chatHistory`         | 对话列表（`[{id, title, time}, ...]`），用于左侧栏展示                 |
+| `chatMessages_conv_*` | 单个对话的完整消息（`[{role, content, thinking}, ...]`），含 HTML 片段 |
+
+### 保存时机
+
+- 每轮 SSE 流结束后（`done` 事件）→ `saveCurrentConversation()`
+- 将 assistant 消息的 `.thinking-container` 完整 HTML 保存到 `thinking` 字段
+- 用户切换到其他对话前 → 先保存当前对话
+
+### 刷新恢复流程
+
+```
+页面刷新 → initChatHistory()
+  → 读取 localStorage → 渲染对话列表
+  → 用户点击某个对话 → loadConversation(convId)
+    → 读取 chatMessages_conv_xxx
+    → 遍历消息：assistant 消息前插入 thinking-container（思考过程）
+    → 渲染消息内容到 chatContainer
+    → 不调任何后端 API，纯前端渲染
+```
+
+### 限制
+
+- localStorage 是浏览器本地存储，**换浏览器/换电脑/清缓存后消失**
+- 后端 SQLite（`data/sessions.db`）是真正的永久存储
+- 两者互补：localStorage 负责 UI 快照恢复，SQLite 负责跨设备/跨会话恢复

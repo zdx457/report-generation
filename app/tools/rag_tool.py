@@ -162,7 +162,11 @@ def create_rag_search_handler(
             if modality:
                 logger.info("rag_search: 从 EntityTracker 自动补全 modality=%s", modality)
         if not body_part and entity_tracker:
-            body_part = entity_tracker.slots.get("body_part", "")
+            bp = entity_tracker.slots.get("body_part", [])
+            if isinstance(bp, list):
+                body_part = " ".join(bp) if bp else ""
+            elif bp:
+                body_part = str(bp)
             if body_part:
                 logger.info("rag_search: 从 EntityTracker 自动补全 body_part=%s", body_part)
 

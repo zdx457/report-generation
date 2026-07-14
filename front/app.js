@@ -635,7 +635,9 @@ async function sendMessage(selectedDiagnosis) {
     });
     saveChatHistory(history);
   }
+  console.log(">>> 准备调用 saveCurrentConversation <<<");
   saveCurrentConversation();
+  console.log(">>> saveCurrentConversation 调用完成 <<<");
   renderChatHistoryList();
 
   console.log("[DEBUG] sendMessage 结束");
@@ -1010,7 +1012,7 @@ function addAmbiguousOptions(data) {
   }).join("");
 
   bubble.innerHTML = `
-    <div class="message-content">
+    <div class="bubble">
       <p>${escapeHtml(question)}</p>
       <div>${optionsHtml}</div>
       <p style="color:#999;font-size:0.8em;margin-top:8px;">点击选择，或直接输入完整描述</p>
@@ -1147,6 +1149,7 @@ function generateConvId() {
 }
 
 function saveCurrentConversation() {
+  console.log("[DEBUG] saveCurrentConversation 被调用, currentConversationId=", currentConversationId);
   const messages = [];
   chatContainer.querySelectorAll(".message").forEach(msg => {
     const isUser = msg.classList.contains("user");
@@ -1159,14 +1162,24 @@ function saveCurrentConversation() {
         content: bubble.innerHTML,
       };
       if (isAssistant) {
-        const thinking = msg.querySelector(".thinking-container");
-        if (thinking) {
-          entry.thinking = thinking.outerHTML;
+        // 思考过程是 assistant 消息的前一个兄弟节点
+        const prev = msg.previousElementSibling;
+        console.log("[DEBUG] assistant msg, prev=", prev ? prev.className : "null");
+        if (prev && prev.classList.contains("thinking-container")) {
+          entry.thinking = prev.outerHTML;
+          console.log("[DEBUG] ✅ 保存思考过程:", prev.outerHTML.length, "字符");
+        } else {
+          console.log("[DEBUG] ❌ 未找到思考过程");
         }
       }
       messages.push(entry);
     }
   });
+
+  console.log("[DEBUG] 共保存", messages.length, "条消息");
+  for (let i = 0; i < messages.length; i++) {
+    console.log("[DEBUG] 消息[" + i + "] role=" + messages[i].role + " thinking=" + (messages[i].thinking ? messages[i].thinking.length + "字符" : "无"));
+  }
 
   if (messages.length === 0) return;
 
@@ -1223,6 +1236,7 @@ function startNewConversation() {
 }
 
 function loadConversation(convId) {
+  console.log("[DEBUG] loadConversation: convId=", convId, "currentConversationId=", currentConversationId);
   if (convId === currentConversationId) return;
 
   saveCurrentConversation();
@@ -1235,23 +1249,27 @@ function loadConversation(convId) {
   }
 
   const messages = getChatMessages(convId);
+  console.log("[DEBUG] loadConversation: 加载了", messages.length, "条消息");
 
   chatContainer.innerHTML = "";
   if (messages.length === 0) {
     chatContainer.appendChild(createEmptyState());
   } else {
-    messages.forEach(msg => {
+    messages.forEach((msg, idx) => {
+      console.log("[DEBUG] 渲染消息[" + idx + "] role=" + msg.role + " thinking=" + (msg.thinking ? msg.thinking.length + "字符" : "无"));
+      if (msg.role === "assistant" && msg.thinking) {
+        // 思考过程作为独立节点插入在 assistant 消息之前
+        const thinkingContainer = document.createElement("div");
+        thinkingContainer.innerHTML = msg.thinking;
+        chatContainer.appendChild(thinkingContainer.firstElementChild);
+        console.log("[DEBUG] ✅ 恢复思考过程:", msg.thinking.length, "字符");
+      }
       const el = document.createElement("div");
       el.className = "message " + msg.role;
       if (msg.role === "user") {
         el.innerHTML = `<div class="message-role">你</div><div class="bubble">${msg.content}</div>`;
       } else if (msg.role === "assistant") {
-        let inner = "";
-        if (msg.thinking) {
-          inner += msg.thinking;
-        }
-        inner += `<div class="message-role">📝 结构化报告</div><div class="bubble">${msg.content}</div>`;
-        el.innerHTML = inner;
+        el.innerHTML = `<div class="message-role">📝 结构化报告</div><div class="bubble">${msg.content}</div>`;
       } else {
         el.innerHTML = `<div class="bubble">${msg.content}</div>`;
       }
@@ -1321,9 +1339,18 @@ function formatDate(date) {
 
 // 初始化：加载历史列表
 function initChatHistory() {
-  currentConversationId = null;
-  SESSION_ID = generateSessionId();
-  renderChatHistoryList();
+  const history = getChatHistory();
+  console.log("[DEBUG] initChatHistory: 历史对话数=", history.length);
+  if (history.length > 0) {
+    // 刷新后自动加载最近一次对话
+    console.log("[DEBUG] initChatHistory: 自动加载最近对话", history[0].id);
+    loadConversation(history[0].id);
+  } else {
+    console.log("[DEBUG] initChatHistory: 无历史对话，新建会话");
+    currentConversationId = null;
+    SESSION_ID = generateSessionId();
+    renderChatHistoryList();
+  }
 }
 
 // 监听清空会话按钮，同时保存当前对话
@@ -1340,6 +1367,11 @@ document.getElementById("btnNewChat").addEventListener("click", startNewConversa
 
 // 页面加载时初始化
 initChatHistory();
+
+// 页面刷新/关闭前自动保存当前对话
+window.addEventListener("beforeunload", () => {
+  saveCurrentConversation();
+});
 
 // ==================== 配置管理 ====================
 

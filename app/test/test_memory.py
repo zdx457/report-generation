@@ -107,7 +107,7 @@ class TestIntentSwitchCleanup:
     def test_entity_has_old_state():
         stm, entity_tracker, last_report, session_id = TestIntentSwitchCleanup.setup()
         assert_equal(entity_tracker.slots["modality"], "CT", "切换前 modality 应为 CT")
-        assert_equal(entity_tracker.slots["body_part"], "脑部", "切换前 body_part 应为 脑部")
+        assert_equal(entity_tracker.slots["body_part"], ["脑部"], "切换前 body_part 应为 脑部")
 
     @test("切换前 last_report 有内容")
     def test_last_report_has_content():
@@ -154,7 +154,7 @@ class TestIntentSwitchCleanup:
 
         entity_tracker.apply_switch("换成 MR 膝关节")
 
-        assert_equal(entity_tracker.slots["body_part"], "膝关节", "切换后 body_part 应为 膝关节")
+        assert_equal(entity_tracker.slots["body_part"], ["膝关节"], "切换后 body_part 应为 膝关节")
 
     @test("切换后旧状态 CT 已消失")
     def test_switch_removes_old_state():
@@ -163,7 +163,7 @@ class TestIntentSwitchCleanup:
         entity_tracker.apply_switch("换成 MR 膝关节")
 
         assert_not_equal(entity_tracker.slots["modality"], "CT", "切换后 modality 不应为 CT（旧状态）")
-        assert_not_equal(entity_tracker.slots["body_part"], "脑部", "切换后 body_part 不应为 脑部（旧状态）")
+        assert_not_equal(entity_tracker.slots["body_part"], ["脑部"], "切换后 body_part 不应为 脑部（旧状态）")
 
     @test("切换后 intent 标记为 switch")
     def test_switch_intent_marked():
@@ -213,34 +213,34 @@ class TestEntityExtractionRobustness:
         tracker = EntityTracker()
         tracker.update_from_query("MR 膝关节")
         assert_equal(tracker.slots["modality"], "MR", "MR 膝关节 → modality 应为 MR")
-        assert_equal(tracker.slots["body_part"], "膝关节", "MR 膝关节 → body_part 应为 膝关节")
+        assert_equal(tracker.slots["body_part"], ["膝关节"], "MR 膝关节 → body_part 应为 膝关节")
 
     @test("歧义验证：MRA 脑血管 准确区分")
     def test_ambiguity_mra_brain():
         tracker = EntityTracker()
         tracker.update_from_query("MRA 脑血管")
         assert_equal(tracker.slots["modality"], "MRA", "MRA 脑血管 → modality 应为 MRA")
-        assert_equal(tracker.slots["body_part"], "脑部", "MRA 脑血管 → body_part 应为 脑部")
+        assert_equal(tracker.slots["body_part"], ["血管"], "MRA 脑血管 → body_part 应为 血管（规则匹配血管）")
 
     @test("歧义验证：MRI 颅脑 准确识别")
     def test_mri_brain():
         tracker = EntityTracker()
         tracker.update_from_query("MRI 颅脑")
         assert_equal(tracker.slots["modality"], "MRI", "MRI 颅脑 → modality 应为 MRI")
-        assert_equal(tracker.slots["body_part"], "颅脑", "MRI 颅脑 → body_part 应为 颅脑")
+        assert_equal(tracker.slots["body_part"], ["颅脑"], "MRI 颅脑 → body_part 应为 颅脑")
 
     @test("部位长词优先：膝关节 不被误识别为 膝")
     def test_body_part_long_word_priority():
         tracker = EntityTracker()
         tracker.update_from_query("膝关节置换术后")
-        assert_equal(tracker.slots["body_part"], "膝关节",
+        assert_equal(tracker.slots["body_part"], ["膝关节"],
                      "必须提取 膝关节，不能误识别为 膝")
 
     @test("部位长词优先：颈椎 不被误识别为 颈")
     def test_body_part_cervical():
         tracker = EntityTracker()
         tracker.update_from_query("颈椎 MRI")
-        assert_equal(tracker.slots["body_part"], "颈椎",
+        assert_equal(tracker.slots["body_part"], ["颈椎"],
                      "必须提取 颈椎")
 
     @test("纯 CT 查询（无歧义）")
@@ -248,14 +248,14 @@ class TestEntityExtractionRobustness:
         tracker = EntityTracker()
         tracker.update_from_query("CT 胸部")
         assert_equal(tracker.slots["modality"], "CT")
-        assert_equal(tracker.slots["body_part"], "胸部")
+        assert_equal(tracker.slots["body_part"], ["胸部"])
 
     @test("超声 查询")
     def test_ultrasound():
         tracker = EntityTracker()
         tracker.update_from_query("超声甲状腺")
         assert_equal(tracker.slots["modality"], "超声")
-        assert_equal(tracker.slots["body_part"], "甲状腺")
+        assert_equal(tracker.slots["body_part"], ["甲状腺"])
 
 
 # ═══════════════════════════════════════════════════════════
@@ -355,7 +355,7 @@ class TestContextResolution:
         tracker.update_from_query("CT 脑")
         # 设置前置状态
         tracker.slots["modality"] = "CT"
-        tracker.slots["body_part"] = "脑"
+        tracker.slots["body_part"] = ["脑"]
 
         result = tracker.resolve_context("再看看肝脏")
         assert_in("CT", result, "消解结果应包含继承的模态 CT")
@@ -365,7 +365,7 @@ class TestContextResolution:
     def test_resolve_this():
         tracker = EntityTracker()
         tracker.slots["modality"] = "CT"
-        tracker.slots["body_part"] = "脑"
+        tracker.slots["body_part"] = ["脑"]
 
         result = tracker.resolve_context("再看看这个")
         assert_in("CT", result, "消解结果应包含继承的模态 CT")
@@ -375,7 +375,7 @@ class TestContextResolution:
     def test_resolve_no_redundant_fill():
         tracker = EntityTracker()
         tracker.slots["modality"] = "CT"
-        tracker.slots["body_part"] = "脑"
+        tracker.slots["body_part"] = ["脑"]
 
         result = tracker.resolve_context("MR 膝关节")
         assert_equal(result, "MR 膝关节", "完整查询不应被消解修改")
@@ -384,7 +384,7 @@ class TestContextResolution:
     def test_resolve_only_modality():
         tracker = EntityTracker()
         tracker.slots["modality"] = "CT"
-        tracker.slots["body_part"] = None
+        tracker.slots["body_part"] = []
 
         result = tracker.resolve_context("再看看肝脏")
         assert_in("CT", result, "缺模态时应补全")
@@ -394,7 +394,7 @@ class TestContextResolution:
     def test_resolve_only_body_part():
         tracker = EntityTracker()
         tracker.slots["modality"] = None
-        tracker.slots["body_part"] = "脑"
+        tracker.slots["body_part"] = ["脑"]
 
         result = tracker.resolve_context("CT 再看看")
         assert_in("CT", result, "应包含新模态")
@@ -412,7 +412,7 @@ class TestContextResolution:
     def test_resolve_continue():
         tracker = EntityTracker()
         tracker.slots["modality"] = "CT"
-        tracker.slots["body_part"] = "肝"
+        tracker.slots["body_part"] = ["肝"]
 
         result = tracker.resolve_context("接着看胃")
         assert_in("CT", result, "应补全模态 CT")

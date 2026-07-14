@@ -1154,12 +1154,15 @@ def web_main(port=8000):
         async def event_stream():
             loop = asyncio.get_event_loop()
             event_queue = queue.Queue()
+            thinking_events = []  # 持久化保存思考过程
 
             def _emit_sse(event_type, data):
                 try:
                     payload = json.dumps({"type": event_type, **data}, ensure_ascii=False)
                     logger.info(f"── _emit_sse: type={event_type}, len={len(payload)}")
                     event_queue.put_nowait(payload)
+                    # 记录思考过程事件
+                    thinking_events.append({"type": event_type, "data": data})
                 except Exception:
                     logger.warning("SSE事件入队失败", exc_info=True)
 
@@ -1193,10 +1196,13 @@ def web_main(port=8000):
                         _ambiguity_cache.pop(session_id, None)
                         logger.info(f"歧义缓存已清除（新查询）: session={session_id}")
 
-                    # ── 持久化：保存对话记录和会话状态 ──
+                    # ── 持久化：保存对话记录、会话状态和思考过程 ──
                     try:
                         store.save_turn(session_id, turn_index, query, result or "")
                         store.save_state(session_id, entity_tracker.slots, last_report[0])
+                        # 保存思考过程
+                        if thinking_events:
+                            store.save_thinking(session_id, turn_index, thinking_events)
                         # 如果第一轮对话，自动更新标题
                         if turn_index == 0:
                             title = query[:20] if len(query) > 20 else query
@@ -1430,6 +1436,11 @@ def web_main(port=8000):
     @app.get("/api/sessions")
     async def list_sessions():
         return {"sessions": store.list_sessions()}
+
+    @app.get("/api/session/thinking")
+    async def get_thinking(session_id: str = "default"):
+        """获取指定会话的思考过程事件"""
+        return {"thinking": store.get_thinking(session_id)}
 
     @app.post("/api/session/new")
     async def new_session():

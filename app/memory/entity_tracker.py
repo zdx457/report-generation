@@ -77,7 +77,7 @@ class EntityTracker:
         """
         self.slots = {
             "modality": None,          # 当前模态 (CT, MR, DR...)
-            "body_part": None,         # 当前部位 (Brain, Chest, Liver...)
+            "body_part": [],           # 当前部位列表 (Brain, Chest, Liver...)
             "clinical_history": "",    # 病史/症状
             "diagnosis": [],           # 已确认的诊断列表
             "intent": "new_session",   # 当前意图: new_session / append / switch
@@ -90,22 +90,25 @@ class EntityTracker:
         """从用户输入提取实体，更新槽位。
 
         优先使用 LLM JSON 结构化提取，失败回退到规则匹配。
+        body_part 支持多部位：新提取的部位追加到列表中，不去重。
 
         Returns:
-            dict: 本次提取到的实体变更 {"modality": "CT", "body_part": "肝脏", ...}
+            dict: 本次提取到的实体变更 {"modality": "CT", "body_part": ["肝脏"], ...}
         """
         changes = {}
 
         if self._llm_chat is not None:
             extracted = self._extract_llm(query)
             if extracted:
-                modality, body_part = extracted
+                modality, body_parts = extracted
                 if modality and modality != self.slots["modality"]:
                     self.slots["modality"] = modality
                     changes["modality"] = modality
-                if body_part and body_part != self.slots["body_part"]:
-                    self.slots["body_part"] = body_part
-                    changes["body_part"] = body_part
+                if body_parts:
+                    new_parts = [p for p in body_parts if p not in self.slots["body_part"]]
+                    if new_parts:
+                        self.slots["body_part"].extend(new_parts)
+                        changes["body_part"] = new_parts
                 if changes:
                     logger.debug("LLM实体更新: %s", changes)
                 return changes
@@ -116,18 +119,20 @@ class EntityTracker:
             self.slots["modality"] = extracted_modality
             changes["modality"] = extracted_modality
 
-        extracted_body_part = self._extract_body_part_rule(query)
-        if extracted_body_part and extracted_body_part != self.slots["body_part"]:
-            self.slots["body_part"] = extracted_body_part
-            changes["body_part"] = extracted_body_part
+        extracted_body_parts = self._extract_body_part_rule(query)
+        if extracted_body_parts:
+            new_parts = [p for p in extracted_body_parts if p not in self.slots["body_part"]]
+            if new_parts:
+                self.slots["body_part"].extend(new_parts)
+                changes["body_part"] = new_parts
 
         if changes:
             logger.debug("规则实体更新: %s", changes)
 
         return changes
 
-    def _extract_llm(self, query: str) -> Optional[Tuple[Optional[str], Optional[str]]]:
-        """使用 LLM 提取实体，返回 JSON 解析后的 (modality, body_part)"""
+    def _extract_llm(self, query: str) -> Optional[Tuple[Optional[str], Optional[list]]]:
+        """使用 LLM 提取实体，返回 JSON 解析后的 (modality, body_parts)"""
         if self._llm_chat is None:
             return None
 
@@ -145,8 +150,12 @@ class EntityTracker:
             return None
 
     @staticmethod
-    def _parse_json_output(output: str) -> Optional[Tuple[Optional[str], Optional[str]]]:
-        """从 LLM 输出中解析 JSON，处理可能的 markdown 代码块包裹"""
+    def _parse_json_output(output: str) -> Optional[Tuple[Optional[str], Optional[list]]]:
+        """从 LLM 输出中解析 JSON，处理可能的 markdown 代码块包裹
+
+        Returns:
+            (modality, body_parts) — body_parts 为部位列表
+        """
         output = output.strip()
 
         if output.startswith("```json"):
@@ -176,15 +185,20 @@ class EntityTracker:
 
         if modality in ("null", "None", "none", ""):
             modality = None
-        if body_part in ("null", "None", "none", ""):
-            body_part = None
-
         if isinstance(modality, str):
             modality = modality.strip()
-        if isinstance(body_part, str):
-            body_part = body_part.strip()
 
-        return (modality, body_part)
+        if body_part in ("null", "None", "none", "", []):
+            body_parts = []
+        elif isinstance(body_part, list):
+            body_parts = [p.strip() for p in body_part if isinstance(p, str) and p.strip() and p.strip() not in ("null", "None", "none", "")]
+        elif isinstance(body_part, str):
+            body_part = body_part.strip()
+            body_parts = [body_part] if body_part and body_part not in ("null", "None", "none", "") else []
+        else:
+            body_parts = []
+
+        return (modality, body_parts)
 
     @staticmethod
     def _extract_modality_rule(query: str) -> Optional[str]:
@@ -196,12 +210,16 @@ class EntityTracker:
         return None
 
     @staticmethod
-    def _extract_body_part_rule(query: str) -> Optional[str]:
-        """规则兜底：从查询中提取检查部位，按长度降序匹配"""
+    def _extract_body_part_rule(query: str) -> list:
+        """规则兜底：从查询中提取所有匹配的检查部位，按长度降序匹配。
+        自动去重：如果短词是已匹配长词的子串，则跳过。"""
+        parts = []
         for pattern in BODY_PART_PATTERNS:
             if pattern in query:
-                return pattern
-        return None
+                # 检查是否被已匹配的长词包含（如"膝关节"已匹配，跳过"膝"）
+                if not any(pattern in p and pattern != p for p in parts):
+                    parts.append(pattern)
+        return parts
 
     def _missing_modality(self, query: str) -> bool:
         """检查查询是否缺少检查类型"""
@@ -212,8 +230,8 @@ class EntityTracker:
     def _missing_body_part(self, query: str) -> bool:
         """检查查询是否缺少检查部位"""
         if self._llm_chat is not None:
-            return self.slots["body_part"] is None and self._extract_body_part_rule(query) is None
-        return self._extract_body_part_rule(query) is None
+            return len(self.slots["body_part"]) == 0 and len(self._extract_body_part_rule(query)) == 0
+        return len(self._extract_body_part_rule(query)) == 0
 
     # ── 意图识别 ──────────────────────────────────────────
 
@@ -238,7 +256,7 @@ class EntityTracker:
                 return True
         # 如果同时包含新模态和新部位，视为切换
         has_modality = EntityTracker._extract_modality_rule(query) is not None
-        has_body_part = EntityTracker._extract_body_part_rule(query) is not None
+        has_body_part = len(EntityTracker._extract_body_part_rule(query)) > 0
         return has_modality and has_body_part
 
     @staticmethod
@@ -268,7 +286,7 @@ class EntityTracker:
         if needs_modality and self.slots["modality"]:
             fill_parts.append(self.slots["modality"])
         if needs_body_part and self.slots["body_part"]:
-            fill_parts.append(self.slots["body_part"])
+            fill_parts.extend(self.slots["body_part"])
 
         if fill_parts:
             return " ".join(fill_parts) + " " + query
@@ -281,7 +299,7 @@ class EntityTracker:
         """重置所有槽位到初始状态"""
         self.slots = {
             "modality": None,
-            "body_part": None,
+            "body_part": [],
             "clinical_history": "",
             "diagnosis": [],
             "intent": "new_session",
@@ -314,7 +332,7 @@ class EntityTracker:
         if self.slots["modality"]:
             parts.append(f"当前检查类型: {self.slots['modality']}")
         if self.slots["body_part"]:
-            parts.append(f"当前检查部位: {self.slots['body_part']}")
+            parts.append(f"当前检查部位: {'、'.join(self.slots['body_part'])}")
         if self.slots["clinical_history"]:
             parts.append(f"已知病史: {self.slots['clinical_history']}")
         if self.slots["diagnosis"]:

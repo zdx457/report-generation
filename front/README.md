@@ -14,7 +14,7 @@
 
 - **聊天**：多轮对话，SSE 流式输出，支持 RAG 检索 / 编辑 / 重写 / 闲聊四种意图
 - **歧义诊断选择**：当检索到多种相似诊断时，以按钮列表形式展示，用户点击后精确选择，避免 LLM 猜测
-- **历史对话**：左侧栏，支持开启新对话、切换历史对话、删除对话，思考过程自动保存
+- **历史对话**：左侧栏，支持开启新对话、切换历史对话、删除对话。对话数据以完整 HTML 形式保存到浏览器 localStorage，**刷新页面后无需调 API 即可恢复 UI**（含思考过程）
 - **短期记忆**：弹窗面板，查看当前对话轮数、实体、摘要，隔离不同对话
 - **Agent 思考**：折叠面板展示意图识别 → 检索查询 → 召回详情 → Rerank → 歧义检测 → 推理 → Token 流
 - **知识库管理**：上传 xlsx → 自动切片 → 构建向量库 → 提取元数据，全程 SSE 实时日志
@@ -68,3 +68,39 @@ app.mount("/static", StaticFiles(directory="../front"), name="static")
 ```
 
 访问 `http://localhost:8000` 即可使用。
+
+## 对话存储机制
+
+前端使用浏览器 **localStorage** 存储对话数据，与后端 SQLite 互补：
+
+| 存储键                | 内容                               | 用途                        |
+| --------------------- | ---------------------------------- | --------------------------- |
+| `chatHistory`         | `[{id, title, time}, ...]`         | 左侧栏对话列表              |
+| `chatMessages_conv_*` | `[{role, content, thinking}, ...]` | 对话完整 HTML（含思考过程） |
+
+### 保存流程
+
+```
+SSE done 事件
+  → saveCurrentConversation()
+    → 遍历 .message 元素
+    → 提取 user/assistant/system 的 .bubble 内容
+    → assistant 消息前查找 .thinking-container → 保存到 thinking 字段
+    → 写入 localStorage
+```
+
+### 恢复流程（刷新后）
+
+```
+页面加载 → initChatHistory()
+  → 读取 localStorage chatHistory → 渲染左侧栏
+  → 用户点击某个对话 → loadConversation(convId)
+    → 读取 chatMessages_conv_xxx
+    → 遍历消息：assistant 消息前插入 thinking-container（思考过程）
+    → 渲染消息内容
+    → 不调任何后端 API
+```
+
+### 存储位置
+
+localStorage 是浏览器内部管理，物理路径（Chrome）：`C:\Users\DELL\AppData\Local\Google\Chrome\User Data\Default\Local Storage\leveldb\`，不可直接读取。通过 F12 → Application → Local Storage 查看。

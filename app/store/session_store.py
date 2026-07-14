@@ -1,6 +1,6 @@
 """会话持久化存储
 
-基于 SQLite 将会话数据（对话历史、实体槽位、上一轮报告）持久化到磁盘，
+基于 SQLite 将会话数据（对话历史、实体槽位、上一轮报告、思考过程）持久化到磁盘，
 实现会话自动保存、断线恢复、历史会话查询与管理。
 
 数据库路径: data/sessions.db（若目录不存在则自动创建）
@@ -9,6 +9,7 @@
   - sessions:      会话元数据（id, title, created_at）
   - turns:         对话记录（session_id, turn_index, user_input, assistant_output）
   - session_state: 会话状态（entity_slots JSON, last_report, updated_at）
+  - thinking:      思考过程（session_id, turn_index, event_type, event_data JSON）
 """
 
 import json
@@ -70,6 +71,19 @@ class SessionStore:
 
                 CREATE INDEX IF NOT EXISTS idx_turns_session
                     ON turns(session_id, turn_index);
+
+                CREATE TABLE IF NOT EXISTS thinking (
+                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    turn_index INTEGER NOT NULL,
+                    event_type TEXT NOT NULL,
+                    event_data TEXT NOT NULL DEFAULT '{}',
+                    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_thinking_session
+                    ON thinking(session_id, turn_index);
             """)
 
     # ── 会话元数据 ──────────────────────────────────────────
@@ -146,10 +160,47 @@ class SessionStore:
             "last_report": row["last_report"] or "",
         }
 
+    # ── 思考过程 ────────────────────────────────────────────
+
+    def save_thinking(self, session_id: str, turn_index: int, events: list[dict]):
+        """保存一轮对话的思考过程事件列表"""
+        if not events:
+            return
+        with self._get_conn() as conn:
+            conn.executemany(
+                "INSERT INTO thinking (session_id, turn_index, event_type, event_data) VALUES (?, ?, ?, ?)",
+                [(session_id, turn_index, e["type"], json.dumps(e.get("data", {}), ensure_ascii=False)) for e in events],
+            )
+
+    def get_thinking(self, session_id: str, turn_index: Optional[int] = None) -> list[dict]:
+        """获取思考过程事件列表"""
+        with self._get_conn() as conn:
+            if turn_index is not None:
+                rows = conn.execute(
+                    "SELECT event_type, event_data FROM thinking WHERE session_id = ? AND turn_index = ? ORDER BY id ASC",
+                    (session_id, turn_index),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT turn_index, event_type, event_data FROM thinking WHERE session_id = ? ORDER BY turn_index ASC, id ASC",
+                    (session_id,),
+                ).fetchall()
+        result = []
+        for r in rows:
+            try:
+                data = json.loads(r["event_data"])
+            except (json.JSONDecodeError, TypeError):
+                data = {}
+            entry = {"type": r["event_type"], "data": data}
+            if "turn_index" in r.keys():
+                entry["turn_index"] = r["turn_index"]
+            result.append(entry)
+        return result
+
     # ── 完整加载/恢复 ───────────────────────────────────────
 
     def load_session(self, session_id: str) -> Optional[dict]:
-        """加载完整会话数据，返回 {title, turns, state} 或 None"""
+        """加载完整会话数据，返回 {title, turns, state, thinking} 或 None"""
         with self._get_conn() as conn:
             session_row = conn.execute(
                 "SELECT id, title, created_at FROM sessions WHERE id = ?",
@@ -160,6 +211,7 @@ class SessionStore:
 
         turns = self.get_turns(session_id)
         state = self.load_state(session_id) or {"entity_slots": {}, "last_report": ""}
+        thinking = self.get_thinking(session_id)
 
         return {
             "id": session_row["id"],
@@ -167,6 +219,7 @@ class SessionStore:
             "created_at": session_row["created_at"],
             "turns": turns,
             "state": state,
+            "thinking": thinking,
         }
 
     def session_exists(self, session_id: str) -> bool:
