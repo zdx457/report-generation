@@ -29,4 +29,3 @@ venv/
 data/
 app/memory/data/
 data/sessions.db
-data/sessions.db
