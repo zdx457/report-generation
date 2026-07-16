@@ -8,7 +8,6 @@
 """
 import argparse
 import os
-import shutil
 import sys
 import time
 
@@ -31,7 +30,14 @@ COLLECTION_NAME = get_collection_name()
 
 
 def parse_md_slice(filepath):
-    """解析切片 md 文件，返回 (自然语言文本, 元数据字典)。"""
+    """解析切片 md 文件，返回 (自然语言文本, 元数据字典, 影像学表现文本)。
+    
+    Returns:
+        tuple: (natural_text, metadata, imaging_text)
+            - natural_text: 完整行内容的自然语言文本
+            - metadata: 元数据字典
+            - imaging_text: 仅影像学表现字段的文本
+    """
     with open(filepath, "r", encoding="utf-8") as f:
         content = f.read()
 
@@ -55,17 +61,20 @@ def parse_md_slice(filepath):
             break
 
     if not header or not data_row:
-        return None, None
+        return None, None, None
 
     text_parts = []
     metadata = {}
+    imaging_text = ""
     for h, v in zip(header, data_row):
         text_parts.append(f"{h}：{v}")
         if h in ("检查类型", "部位", "检查项目", "诊断结论"):
             metadata[h] = v
+        if h == "影像学表现" and v.strip():
+            imaging_text = v.strip()
 
     natural_text = "\n".join(text_parts)
-    return natural_text, metadata
+    return natural_text, metadata, imaging_text
 
 
 def get_embeddings(texts, batch_size=16, progress_callback=None):
@@ -127,6 +136,7 @@ def create_collection(client):
         FieldSchema(name="vector", dtype=DataType.FLOAT_VECTOR, dim=EMBED_DIM),
         FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=4096),
         FieldSchema(name="source", dtype=DataType.VARCHAR, max_length=512),
+        FieldSchema(name="vector_type", dtype=DataType.VARCHAR, max_length=64),
         FieldSchema(name="检查类型", dtype=DataType.VARCHAR, max_length=256),
         FieldSchema(name="部位", dtype=DataType.VARCHAR, max_length=256),
         FieldSchema(name="检查项目", dtype=DataType.VARCHAR, max_length=256),
@@ -143,8 +153,15 @@ def create_collection(client):
     )
 
 
-def insert_data(client, texts, metadatas, source_files, embeddings):
-    """将数据插入集合。"""
+def insert_data(client, texts, metadatas, source_files, embeddings, vector_types=None):
+    """将数据插入集合。
+    
+    Args:
+        vector_types: 向量类型列表，与 texts 一一对应（"full_row" 或 "opinion"）
+    """
+    if vector_types is None:
+        vector_types = ["full_row"] * len(texts)
+    
     data = []
     for i in range(len(texts)):
         meta = metadatas[i]
@@ -152,6 +169,7 @@ def insert_data(client, texts, metadatas, source_files, embeddings):
             "vector": embeddings[i],
             "text": texts[i],
             "source": source_files[i],
+            "vector_type": vector_types[i],
             "检查类型": meta.get("检查类型", ""),
             "部位": meta.get("部位", ""),
             "检查项目": meta.get("检查项目", ""),
@@ -179,14 +197,14 @@ def build_db(input_dir, batch_size=16, rebuild=False, progress_callback=None):
         _log(f"在 {input_dir} 中未找到 md 文件", "error")
         return
 
-    if rebuild:
-        _log("全量重建模式：删除旧数据...")
-        if os.path.exists(DB_PATH):
-            shutil.rmtree(DB_PATH)
-
     client = MilvusClient(uri=DB_PATH)
 
     if rebuild:
+        _log("全量重建模式：清空旧数据...")
+        if client.has_collection(COLLECTION_NAME):
+            _log(f"删除集合: {COLLECTION_NAME}")
+            client.drop_collection(COLLECTION_NAME)
+            _log("集合已删除")
         create_collection(client)
         new_files = md_files
         _log(f"将处理全部 {len(new_files)} 个切片文件")
@@ -203,39 +221,80 @@ def build_db(input_dir, batch_size=16, rebuild=False, progress_callback=None):
 
     _log(f"开始解析 {len(new_files)} 个新切片...")
 
-    texts = []
-    metadatas = []
-    source_files = []
+    # ── 双通道数据收集 ──
+    # full_row 通道：完整行内容
+    full_texts = []
+    full_metadatas = []
+    full_sources = []
+    
+    # imaging 通道：仅影像学表现
+    imaging_texts = []
+    imaging_metadatas = []
+    imaging_sources = []
+
     for fname in new_files:
         fpath = os.path.join(input_dir, fname)
-        text, meta = parse_md_slice(fpath)
+        text, meta, imaging = parse_md_slice(fpath)
         if text:
-            texts.append(text)
-            metadatas.append(meta or {})
-            source_files.append(fname)
+            # 通道1：完整行
+            full_texts.append(text)
+            full_metadatas.append(meta or {})
+            full_sources.append(fname)
+            
+            # 通道2：影像学表现（如果存在）
+            if imaging:
+                imaging_texts.append(imaging)
+                imaging_metadatas.append(meta or {})
+                imaging_sources.append(fname)
 
-    _log(f"有效新切片: {len(texts)} 条")
-    if not texts:
+    _log(f"完整行通道: {len(full_texts)} 条")
+    _log(f"影像学表现通道: {len(imaging_texts)} 条")
+    _log(f"总计待向量化: {len(full_texts) + len(imaging_texts)} 条")
+    
+    if not full_texts:
         _log("没有有效切片可添加")
         client.close()
         return
 
     _log(f"开始向量化 (batch_size={batch_size})...")
-    embeddings = get_embeddings(texts, batch_size=batch_size, progress_callback=progress_callback)
+    
+    # 合并两个通道的文本进行批量向量化
+    all_texts = full_texts + imaging_texts
+    all_embeddings = get_embeddings(all_texts, batch_size=batch_size, progress_callback=progress_callback)
 
-    if not embeddings:
+    if not all_embeddings:
         _log("向量化失败，未获取到任何向量", "error")
         client.close()
         return
 
-    _log(f"向量化完成，维度: {len(embeddings[0])}")
+    _log(f"向量化完成，维度: {len(all_embeddings[0])}")
     _log("写入 Milvus Lite...")
 
-    inserted = insert_data(client, texts, metadatas, source_files, embeddings)
+    # 分离两个通道的嵌入向量
+    full_embeddings = all_embeddings[:len(full_texts)]
+    imaging_embeddings = all_embeddings[len(full_texts):]
+    
+    # 插入完整行通道
+    inserted_full = 0
+    if full_embeddings:
+        inserted_full = insert_data(
+            client, full_texts, full_metadatas, full_sources, 
+            full_embeddings, vector_types=["full_row"] * len(full_texts)
+        )
+        _log(f"完整行通道插入: {inserted_full} 条")
+    
+    # 插入影像学表现通道
+    inserted_imaging = 0
+    if imaging_embeddings:
+        inserted_imaging = insert_data(
+            client, imaging_texts, imaging_metadatas, imaging_sources,
+            imaging_embeddings, vector_types=["imaging"] * len(imaging_texts)
+        )
+        _log(f"影像学表现通道插入: {inserted_imaging} 条")
 
     total = client.query(COLLECTION_NAME, filter="", output_fields=["count(*)"])
     total_count = len(total)
-    _log(f"本次新增: {inserted} 条")
+    _log(f"本次新增总计: {inserted_full + inserted_imaging} 条")
     _log(f"数据库总计: {total_count} 条")
     _log(f"数据库文件: {DB_PATH}")
     client.close()

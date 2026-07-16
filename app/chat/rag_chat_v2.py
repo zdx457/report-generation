@@ -771,6 +771,29 @@ def run_pipeline(query, session_id, stm, entity_tracker, ltm, client, last_repor
             logger.info(f"查询改写: '{original}' → '{rewritten}'")
             _emit("query_rewrite", {"original": original, "rewritten": rewritten})
 
+    # ── 模糊输入拦截：如果只有模态，没有部位/诊断，且有 last_report，追问用户意图 ──
+    if not selected_diagnosis:
+        has_modality = entity_tracker.slots.get("modality") is not None
+        has_body_part = len(entity_tracker.slots.get("body_part", [])) > 0
+        has_diagnosis = len(entity_tracker.slots.get("diagnosis", [])) > 0
+        has_report = last_report and last_report[0]
+        
+        if has_modality and not has_body_part and not has_diagnosis and has_report:
+            # 输入过于模糊（如只有"CT"），追问用户意图
+            logger.info(f"模糊输入拦截：modality={entity_tracker.slots['modality']}, 无部位/诊断，已有报告")
+            clarification_msg = (
+                f"检测到您只输入了检查类型 '{entity_tracker.slots['modality']}'，但未指定检查部位或诊断。\n\n"
+                f"请选择您想执行的操作：\n"
+                f"1. **修改当前报告**：修改已有的报告内容\n"
+                f"2. **重新检索**：用 '{entity_tracker.slots['modality']}' 重新检索知识库生成新报告\n"
+                f"3. **补充部位**：如 'CT 头颅'、'CT 腹部' 等\n\n"
+                f"请明确告知您的意图，或直接输入完整的查询（如 'CT 脑出血'）。"
+            )
+            _emit("message", {"content": clarification_msg})
+            stm.add_turn(session_id, query, clarification_msg)
+            logger.info(f"── run_pipeline 完成：模糊输入追问")
+            return clarification_msg
+
     history = stm.get_history(session_id)
 
     # ── Phase 2: Tool Calling 主循环 ──

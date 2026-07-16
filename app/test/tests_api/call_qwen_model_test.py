@@ -14,7 +14,7 @@ import requests
 import sys
 
 BASE_URL = "http://14.22.86.97:11001/v1"
-MODEL = "qwen36_27b_lora"
+MODEL = "qwen36-27b"
 PROMPT_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "system_prompt.md")
 
 

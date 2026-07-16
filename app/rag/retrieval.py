@@ -28,7 +28,7 @@ except ImportError:
 
 COLLECTION_NAME = get_collection_name()
 
-OUTPUT_FIELDS = ["text", "source", "检查类型", "部位", "检查项目", "诊断结论"]
+OUTPUT_FIELDS = ["text", "source", "vector_type", "检查类型", "部位", "检查项目", "诊断结论"]
 
 
 def _esc_filter(value):
@@ -55,6 +55,7 @@ def vector_search(query_vec, top_k, client):
         data=[query_vec],
         limit=top_k,
         output_fields=OUTPUT_FIELDS,
+        timeout=60,  # 60秒超时，防止 Milvus 卡住导致整个请求挂起
     )
 
     candidates = []
@@ -98,12 +99,13 @@ def metadata_filter(keywords, top_k, client):
     filter_expr = " and ".join(conditions)
 
     try:
-        client.load_collection(COLLECTION_NAME)
+        client.load_collection(COLLECTION_NAME, timeout=30)
         results = client.query(
             COLLECTION_NAME,
             filter=filter_expr,
             output_fields=OUTPUT_FIELDS,
             limit=top_k,
+            timeout=60,  # 60秒超时
         )
     except Exception:
         return []
@@ -163,12 +165,13 @@ def keyword_search(keywords, top_k, client):
         filter_expr = f"({filter_expr}) and {' and '.join(extra_conds)}"
 
     try:
-        client.load_collection(COLLECTION_NAME)
+        client.load_collection(COLLECTION_NAME, timeout=30)
         results = client.query(
             COLLECTION_NAME,
             filter=filter_expr,
             output_fields=OUTPUT_FIELDS,
             limit=top_k,
+            timeout=60,  # 60秒超时
         )
     except Exception:
         return []
@@ -184,6 +187,9 @@ def keyword_search(keywords, top_k, client):
 def multi_recall(query_vec, keywords, top_k, client, recall_paths=None, return_details=False):
     """多路召回 + 去重。
 
+    支持双通道向量化（full_row 和 opinion），同一 source 的多个向量会被合并，
+    保留最高分数的向量文本，同时标记命中的向量类型。
+
     Args:
         query_vec: 查询向量 (1024维)
         keywords: parse_query_keywords 返回的关键词字典
@@ -198,6 +204,7 @@ def multi_recall(query_vec, keywords, top_k, client, recall_paths=None, return_d
             - _distance: 向量检索距离（-1 表示非向量检索）
             - _recall_path: 召回路径（"vector"/"metadata"/"keyword"/"multi"）
             - _recall_paths: 所有命中该文档的召回路径列表
+            - _vector_types: 命中的向量类型列表（["full_row"], ["opinion"], 或两者都有）
 
         当 return_details=True 时，返回 (candidates, details) 元组，
         details 为 dict，包含各路原始结果:
@@ -214,10 +221,24 @@ def multi_recall(query_vec, keywords, top_k, client, recall_paths=None, return_d
         details["vector"] = vec_results
         for entity in vec_results:
             src = entity["source"]
+            vector_type = entity.get("vector_type", "full_row")
+            
             if src in candidates:
                 candidates[src]["_recall_paths"].append("vector")
+                # 收集命中的向量类型
+                if "_vector_types" not in candidates[src]:
+                    candidates[src]["_vector_types"] = set()
+                candidates[src]["_vector_types"].add(vector_type)
+                
+                # 如果新向量的分数更高，更新 text 和 distance
+                if entity.get("_distance", 0) > candidates[src].get("_distance", -1):
+                    candidates[src]["text"] = entity["text"]
+                    candidates[src]["_distance"] = entity["_distance"]
+                    candidates[src]["_primary_vector"] = vector_type
             else:
                 entity["_recall_paths"] = ["vector"]
+                entity["_vector_types"] = {vector_type}
+                entity["_primary_vector"] = vector_type
                 candidates[src] = entity
 
     if "metadata" in recall_paths:
@@ -229,6 +250,7 @@ def multi_recall(query_vec, keywords, top_k, client, recall_paths=None, return_d
                 candidates[src]["_recall_paths"].append("metadata")
             else:
                 entity["_recall_paths"] = ["metadata"]
+                entity["_vector_types"] = set()
                 candidates[src] = entity
 
     if "keyword" in recall_paths:
@@ -240,6 +262,7 @@ def multi_recall(query_vec, keywords, top_k, client, recall_paths=None, return_d
                 candidates[src]["_recall_paths"].append("keyword")
             else:
                 entity["_recall_paths"] = ["keyword"]
+                entity["_vector_types"] = set()
                 candidates[src] = entity
 
     result = list(candidates.values())
@@ -248,6 +271,9 @@ def multi_recall(query_vec, keywords, top_k, client, recall_paths=None, return_d
             entity["_recall_path"] = "multi"
         else:
             entity["_recall_path"] = entity["_recall_paths"][0]
+        
+        # 将 set 转换为 list 以便 JSON 序列化
+        entity["_vector_types"] = list(entity.get("_vector_types", set()))
 
     if return_details:
         return result, details

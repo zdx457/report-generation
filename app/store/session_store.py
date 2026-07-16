@@ -65,6 +65,7 @@ class SessionStore:
                     session_id   TEXT UNIQUE NOT NULL,
                     entity_slots TEXT NOT NULL DEFAULT '{}',
                     last_report  TEXT NOT NULL DEFAULT '',
+                    last_ambiguity TEXT NOT NULL DEFAULT '{}',
                     updated_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
                     FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
                 );
@@ -85,6 +86,14 @@ class SessionStore:
                 CREATE INDEX IF NOT EXISTS idx_thinking_session
                     ON thinking(session_id, turn_index);
             """)
+
+        # 迁移：为已有表添加新字段（如果不存在）
+        with self._get_conn() as conn:
+            try:
+                conn.execute("ALTER TABLE session_state ADD COLUMN last_ambiguity TEXT NOT NULL DEFAULT '{}'")
+                logger.info("已迁移 session_state 表：添加 last_ambiguity 字段")
+            except Exception:
+                pass  # 字段已存在，忽略
 
     # ── 会话元数据 ──────────────────────────────────────────
 
@@ -131,22 +140,23 @@ class SessionStore:
 
     # ── 会话状态 ────────────────────────────────────────────
 
-    def save_state(self, session_id: str, entity_slots: dict, last_report: str):
-        """保存会话上下文状态（实体槽位 + 上一轮报告）"""
+    def save_state(self, session_id: str, entity_slots: dict, last_report: str, last_ambiguity: dict = None):
+        """保存会话上下文状态（实体槽位 + 上一轮报告 + 歧义缓存）"""
         slots_json = json.dumps(entity_slots, ensure_ascii=False)
+        ambiguity_json = json.dumps(last_ambiguity or {}, ensure_ascii=False)
         with self._get_conn() as conn:
             conn.execute(
-                "INSERT INTO session_state (session_id, entity_slots, last_report, updated_at) "
-                "VALUES (?, ?, ?, CURRENT_TIMESTAMP) "
-                "ON CONFLICT(session_id) DO UPDATE SET entity_slots=excluded.entity_slots, last_report=excluded.last_report, updated_at=CURRENT_TIMESTAMP",
-                (session_id, slots_json, last_report),
+                "INSERT INTO session_state (session_id, entity_slots, last_report, last_ambiguity, updated_at) "
+                "VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP) "
+                "ON CONFLICT(session_id) DO UPDATE SET entity_slots=excluded.entity_slots, last_report=excluded.last_report, last_ambiguity=excluded.last_ambiguity, updated_at=CURRENT_TIMESTAMP",
+                (session_id, slots_json, last_report, ambiguity_json),
             )
 
     def load_state(self, session_id: str) -> Optional[dict]:
-        """加载会话状态，返回 {entity_slots, last_report} 或 None"""
+        """加载会话状态，返回 {entity_slots, last_report, last_ambiguity} 或 None"""
         with self._get_conn() as conn:
             row = conn.execute(
-                "SELECT entity_slots, last_report FROM session_state WHERE session_id = ?",
+                "SELECT entity_slots, last_report, last_ambiguity FROM session_state WHERE session_id = ?",
                 (session_id,),
             ).fetchone()
         if row is None:
@@ -155,9 +165,14 @@ class SessionStore:
             slots = json.loads(row["entity_slots"])
         except (json.JSONDecodeError, TypeError):
             slots = {}
+        try:
+            ambiguity = json.loads(row["last_ambiguity"])
+        except (json.JSONDecodeError, TypeError):
+            ambiguity = {}
         return {
             "entity_slots": slots,
             "last_report": row["last_report"] or "",
+            "last_ambiguity": ambiguity,
         }
 
     # ── 思考过程 ────────────────────────────────────────────

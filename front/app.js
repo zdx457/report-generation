@@ -218,7 +218,15 @@ async function refreshKBStatus() {
   try {
     const resp = await fetch(`${API_BASE}/kb/status?t=${Date.now()}`);
     const data = await resp.json();
-    kbTotal.textContent = data.total !== undefined ? data.total : "-";
+    
+    if (data.rebuilding) {
+      kbTotal.textContent = "重建中...";
+      kbTotal.style.color = "#ff9800";
+    } else {
+      kbTotal.textContent = data.total !== undefined ? data.total : "-";
+      kbTotal.style.color = "";
+    }
+    
     kbMdCount.textContent = data.md_count !== undefined ? data.md_count : "-";
     kbMeta.textContent = data.metadata_exists ? "✅ 已生成" : "❌ 未生成";
     kbMeta.style.color = data.metadata_exists ? "#2e7d32" : "#e53935";
@@ -390,8 +398,22 @@ async function runExtractMetadata() {
 }
 
 function appendKBLog(msg, level) {
+  // 进度类消息：覆盖上一条进度，而不是追加
+  if (msg.includes("向量化进度")) {
+    const lastProgress = kbLogContent.querySelector(".kb-log-progress");
+    if (lastProgress) {
+      lastProgress.textContent = msg;
+      lastProgress.className = `kb-log-line kb-log-${level} kb-log-progress`;
+      kbLogContent.scrollTop = kbLogContent.scrollHeight;
+      return;
+    }
+  }
+  
   const div = document.createElement("div");
   div.className = `kb-log-line kb-log-${level}`;
+  if (msg.includes("向量化进度")) {
+    div.classList.add("kb-log-progress");
+  }
   div.textContent = msg;
   kbLogContent.appendChild(div);
   kbLogContent.scrollTop = kbLogContent.scrollHeight;

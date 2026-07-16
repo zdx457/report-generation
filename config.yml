@@ -11,6 +11,8 @@ llms:
   api_key: ''
   max_tokens: 2048
   temperature: 0.3
+- name: qwen3.6-plus
+  api_key: ''
 embeddings:
 - name: bge-m3
   base_url: http://14.22.83.225:11002/v1/embeddings
