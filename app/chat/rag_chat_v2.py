@@ -727,14 +727,26 @@ def run_pipeline(query, session_id, stm, entity_tracker, ltm, client, last_repor
     """
     logger.info(f"── run_pipeline 开始: session={session_id}, query={query[:50]}..., selected_diagnosis={selected_diagnosis}")
 
+    # ── 缓存命中检查：新输入是否匹配缓存中的诊断 ──
+    if not selected_diagnosis and last_ambiguity and last_ambiguity[0] is not None:
+        _, cached_reranked = last_ambiguity[0]
+        for entity in cached_reranked:
+            diagnosis_name = entity.get("diagnosis_name", "") or entity.get("诊断结论", "")
+            # 检查用户输入是否与缓存中的诊断匹配（完全匹配或包含关系）
+            if diagnosis_name and (query == diagnosis_name or diagnosis_name in query or query in diagnosis_name):
+                logger.info(f"输入命中缓存诊断: query='{query}' ≈ diagnosis='{diagnosis_name}'，自动跳过检索")
+                selected_diagnosis = diagnosis_name
+                break
+
     # ── Phase 1: 输入处理 ──
-    # 如果用户点击了歧义选项，跳过实体提取/意图检测/上下文消解，
+    # 如果用户点击了歧义选项，或输入命中缓存诊断，跳过实体提取/意图检测/上下文消解，
     # 保留上一轮的 modality/body_part 槽位，确保缓存命中
     if selected_diagnosis:
-        logger.info("run_pipeline: 用户通过歧义选项选择诊断，跳过 Phase 1，保留槽位")
+        logger.info("run_pipeline: 用户通过歧义选项/缓存命中选择诊断，跳过 Phase 1，保留槽位")
         # 明确告知 LLM：用户已选择诊断，请调用 rag_search 生成报告
-        enhanced = f"用户选择了诊断：{query}。请使用 rag_search 工具生成该诊断的结构化报告。"
+        enhanced = f"用户选择了诊断：{selected_diagnosis}。请使用 rag_search 工具生成该诊断的结构化报告。"
         _emit("intent", {"intent": "TOOL_CALL"})
+        _emit("cache_hit", {"query": query, "matched_diagnosis": selected_diagnosis})
     else:
         # 1. 实体提取：从用户输入提取实体更新槽位
         changes = entity_tracker.update_from_query(query)
@@ -1214,10 +1226,7 @@ def web_main(port=8000):
                     if last_ambiguity[0] is not None:
                         _ambiguity_cache[session_id] = last_ambiguity[0]
                         logger.info(f"歧义缓存已同步到全局: session={session_id}")
-                    # 只有缓存之前就存在 + 本轮是新查询（非点击）时才清除
-                    if cache_existed_before and not selected_diagnosis:
-                        _ambiguity_cache.pop(session_id, None)
-                        logger.info(f"歧义缓存已清除（新查询）: session={session_id}")
+                    # 不再自动清除缓存，保留供后续查询匹配
 
                     # ── 持久化：保存对话记录、会话状态和思考过程 ──
                     try:

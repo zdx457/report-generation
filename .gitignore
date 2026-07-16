@@ -26,4 +26,5 @@ venv/
 
 .docker/
 
+data/
 app/memory/data/
