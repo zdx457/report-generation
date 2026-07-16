@@ -6,11 +6,19 @@ dist/
 build/
 
 milvus_lite.db/
+milvus_lite.db
 xlsx_slices/
 report_template/
 
 *.xlsx
 ~$*.xlsx
+
+sessions.db
+sessions.db-shm
+sessions.db-wal
+
+*.db-shm
+*.db-wal
 
 .env
 .venv/
