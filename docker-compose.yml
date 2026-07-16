@@ -1,22 +1,28 @@
 services:
-  rag-web:
+  app:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: report-generation
     ports:
-      - "${HOST_PORT:-7860}:7860"
+      - "${HOST_PORT:-7860}:8000"
     volumes:
-      - ./app/milvus_lite.db:/app/app/milvus_lite.db
-      - ./app/xlsx_slices:/app/app/xlsx_slices
+      # 向量数据库（Milvus Lite）
+      - ./app/data_pipeline/milvus_lite.db:/app/app/data_pipeline/milvus_lite.db
+      # Excel 切片文件
+      - ./app/data_pipeline/xlsx_slices:/app/app/data_pipeline/xlsx_slices
+      # 报告模板
       - ./app/report_template:/app/app/report_template
+      # 会话持久化
+      - ./data:/app/data
+      # 长期记忆
+      - ./app/memory/data:/app/app/memory/data
     env_file:
       - .env
     environment:
-      - GRADIO_SERVER_NAME=0.0.0.0
-      - GRADIO_SERVER_PORT=7860
+      - PYTHONUNBUFFERED=1
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:7860/"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/"]
       interval: 30s
       timeout: 10s
       start_period: 30s

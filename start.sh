@@ -48,10 +48,12 @@ init_env() {
 }
 
 init_dirs() {
-    mkdir -p app/milvus_lite.db
-    mkdir -p app/xlsx_slices
+    mkdir -p app/data_pipeline/milvus_lite.db
+    mkdir -p app/data_pipeline/xlsx_slices
     mkdir -p app/report_template
-    chown -R 1000:1000 app/milvus_lite.db app/xlsx_slices app/report_template
+    mkdir -p data
+    mkdir -p app/memory/data
+    chown -R 1000:1000 app/data_pipeline app/report_template data app/memory/data
     info "数据目录已就绪"
 }
 
