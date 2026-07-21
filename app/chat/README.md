@@ -49,7 +49,13 @@ chat/
     ├ 实体提取（LLM + 规则双引擎）
     ├ 意图检测（new_session / append / switch）
     ├ 上下文消解（补全省略信息）
+    ├ 模糊输入拦截（只有模态，无部位/诊断）→ 追问用户意图
     └ ★ 如果 selected_diagnosis 非空（用户点击歧义按钮）→ 跳过 Phase 1，保留 modality/body_part
+    │
+    ▼
+[Phase 1.5] 输入校验
+    ├ 缺少模态拦截：有部位/诊断但无模态 → 追问检查类型（如"脑出血"需补充 CT/MR）
+    └ 防止无模态生成报告，确保报告完整性
     │
     ▼
 [Phase 2] Tool Calling 主循环

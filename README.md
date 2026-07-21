@@ -51,6 +51,7 @@ cp .env.example .env
 ### 2. 一键启动
 
 ```bash
+sed -i 's/\r$//' start.sh
 chmod +x start.sh
 ./start.sh start
 ```

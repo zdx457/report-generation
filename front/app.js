@@ -4,7 +4,12 @@ console.log("[APP] app.js v2 已加载, 时间:", new Date().toISOString());
 let SESSION_ID = generateSessionId();
 
 function generateSessionId() {
-  return "web_" + crypto.randomUUID();
+  // crypto.randomUUID() 仅在 HTTPS 或 localhost 下可用
+  if (crypto && crypto.randomUUID) {
+    return "web_" + crypto.randomUUID();
+  }
+  // 降级方案：使用 Math.random 生成 UUID
+  return "web_" + Date.now().toString(36) + "_" + Math.random().toString(36).substr(2, 9) + Math.random().toString(36).substr(2, 9);
 }
 
 // DOM 元素
@@ -198,7 +203,7 @@ sidebarBtns.forEach(btn => {
     sidebarBtns.forEach(b => b.classList.remove("active"));
     btn.classList.add("active");
     pages.forEach(p => p.classList.remove("active"));
-    const pageMap = { agent: "pageAgent", kb: "pageKB", config: "pageConfig" };
+    const pageMap = { agent: "pageAgent", kb: "pageKB", config: "pageConfig", monitor: "pageMonitor" };
     const target = document.getElementById(pageMap[page] || "pageAgent");
     if (target) target.classList.add("active");
     if (page === "kb") {
@@ -206,6 +211,9 @@ sidebarBtns.forEach(btn => {
     }
     if (page === "config") {
       loadConfig();
+    }
+    if (page === "monitor") {
+      loadSessionsList();
     }
   });
 });
@@ -753,6 +761,10 @@ function handleStreamEvent(event, thinking) {
       finishThinking(thinking);
       addAmbiguousOptions(event);
       break;
+
+    case "context_usage":
+      updateContextUsage(event.percent || 0);
+      break;
   }
 }
 
@@ -1017,6 +1029,26 @@ function addToolExecutedDetail(container, data) {
   scrollToBottom();
 }
 
+// ========== 上下文使用率 ==========
+
+function updateContextUsage(percent) {
+  const usageEl = document.getElementById("contextUsage");
+  const percentEl = document.getElementById("contextPercent");
+  
+  if (!usageEl || !percentEl) return;
+  
+  usageEl.style.display = "inline-block";
+  percentEl.textContent = Math.round(percent);
+  
+  // 根据使用率切换样式
+  usageEl.classList.remove("warning", "danger");
+  if (percent >= 80) {
+    usageEl.classList.add("danger");
+  } else if (percent >= 60) {
+    usageEl.classList.add("warning");
+  }
+}
+
 // ========== 歧义选项 ==========
 
 function addAmbiguousOptions(data) {
@@ -1030,14 +1062,14 @@ function addAmbiguousOptions(data) {
 
   var optionsHtml = (options || []).map(function (opt, i) {
     var scoreText = scores[i] ? ' <span style="color:#999;font-size:0.8em;">(' + (scores[i] * 100).toFixed(1) + '%)</span>' : '';
-    return '<button class="ambiguity-option" onclick="selectAmbiguityOption(\'' + escapeHtml(opt) + '\')" style="display:block;margin:4px 0;padding:8px 16px;border:1px solid #667eea;border-radius:8px;background:#f0f0ff;cursor:pointer;text-align:left;width:100%;">' + (i + 1) + '. ' + escapeHtml(opt) + scoreText + '</button>';
+    return '<button class="ambiguity-option" onclick="selectAmbiguityOption(\'' + escapeHtml(opt) + '\')">' + (i + 1) + '. ' + escapeHtml(opt) + scoreText + '</button>';
   }).join("");
 
   bubble.innerHTML = `
     <div class="bubble">
       <p>${escapeHtml(question)}</p>
       <div>${optionsHtml}</div>
-      <p style="color:#999;font-size:0.8em;margin-top:8px;">点击选择，或直接输入完整描述</p>
+      <p style="color:#999;font-size:0.8em;margin-top:8px;">如果以上没有匹配的诊断，请详细描述病情或直接输入完整检查信息（如 "CT 头颅 脑出血"）</p>
     </div>
   `;
   chatContainer.appendChild(bubble);
@@ -1167,7 +1199,11 @@ function deleteChatMessages(convId) {
 }
 
 function generateConvId() {
-  return "conv_" + crypto.randomUUID();
+  // crypto.randomUUID() 仅在 HTTPS 或 localhost 下可用
+  if (crypto && crypto.randomUUID) {
+    return "conv_" + crypto.randomUUID();
+  }
+  return "conv_" + Date.now().toString(36) + "_" + Math.random().toString(36).substr(2, 9) + Math.random().toString(36).substr(2, 9);
 }
 
 function saveCurrentConversation() {
@@ -1911,3 +1947,127 @@ function addUserMessage(text) {
   chatContainer.appendChild(msg);
   scrollToBottom();
 }
+
+// ========== 会话监控 ==========
+const monitorTotalSessions = document.getElementById("monitorTotalSessions");
+const monitorTotalTurns = document.getElementById("monitorTotalTurns");
+const monitorLastUpdate = document.getElementById("monitorLastUpdate");
+const monitorSessionsList = document.getElementById("monitorSessionsList");
+const btnRefreshSessions = document.getElementById("btnRefreshSessions");
+const sessionDetailModal = document.getElementById("sessionDetailModal");
+const sessionDetailInfo = document.getElementById("sessionDetailInfo");
+const sessionDetailTurns = document.getElementById("sessionDetailTurns");
+const btnCloseSessionDetail = document.getElementById("btnCloseSessionDetail");
+
+// 加载会话列表
+async function loadSessionsList() {
+  try {
+    const res = await fetch(`${API_BASE}/sessions`);
+    const data = await res.json();
+    const sessions = data.sessions || [];
+
+    // 更新统计
+    monitorTotalSessions.textContent = sessions.length;
+    const totalTurns = sessions.reduce((sum, s) => sum + (s.turn_count || 0), 0);
+    monitorTotalTurns.textContent = totalTurns;
+    monitorLastUpdate.textContent = new Date().toLocaleString("zh-CN");
+
+    if (sessions.length === 0) {
+      monitorSessionsList.innerHTML = '<div class="monitor-empty">暂无会话</div>';
+      return;
+    }
+
+    // 按创建时间倒序排序
+    sessions.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+
+    monitorSessionsList.innerHTML = sessions
+      .map(
+        (s) => `
+        <div class="monitor-session-row" data-session-id="${s.id}">
+          <span class="monitor-session-id" title="${s.id}">${s.id.slice(0, 20)}...</span>
+          <span class="monitor-session-title" title="${s.title || "未命名"}">${s.title || "未命名"}</span>
+          <span class="monitor-session-turns">${s.turn_count || 0}</span>
+          <span class="monitor-session-time">${s.created_at || "-"}</span>
+          <span class="monitor-session-actions">
+            <button class="btn btn-sm btn-outline" onclick="viewSessionDetail('${s.id}')">查看</button>
+            <button class="btn btn-sm btn-danger" onclick="deleteSession('${s.id}')">删除</button>
+          </span>
+        </div>
+      `
+      )
+      .join("");
+  } catch (e) {
+    monitorSessionsList.innerHTML = `<div class="monitor-empty">加载失败: ${e.message}</div>`;
+  }
+}
+
+// 查看会话详情
+async function viewSessionDetail(sessionId) {
+  try {
+    // 加载会话记忆
+    const res = await fetch(`${API_BASE}/memory?session_id=${sessionId}`);
+    const data = await res.json();
+
+    // 显示基本信息
+    sessionDetailInfo.innerHTML = `
+      <span>会话 ID: <strong>${sessionId.slice(0, 30)}...</strong></span>
+      <span>当前轮次: <strong>${data.current_turns || 0}</strong></span>
+      <span>总轮次: <strong>${data.total_turns || 0}</strong></span>
+    `;
+
+    // 显示对话历史
+    if (data.turns && data.turns.length > 0) {
+      sessionDetailTurns.innerHTML = data.turns
+        .map(
+          (t) => `
+        <div class="session-turn">
+          <div class="session-turn-user">${escapeHtml(t.user || "(空)")}</div>
+          <div class="session-turn-assistant">${renderMarkdown(t.assistant || "(空)")}</div>
+        </div>
+      `
+        )
+        .join("");
+    } else {
+      sessionDetailTurns.innerHTML = '<div class="monitor-empty">暂无对话记录</div>';
+    }
+
+    sessionDetailModal.style.display = "flex";
+  } catch (e) {
+    alert(`加载会话详情失败: ${e.message}`);
+  }
+}
+
+// 删除会话
+async function deleteSession(sessionId) {
+  if (!confirm(`确定要删除会话 ${sessionId.slice(0, 20)}... 吗？此操作不可恢复。`)) {
+    return;
+  }
+
+  try {
+    await fetch(`${API_BASE}/session?session_id=${sessionId}`, {
+      method: "DELETE",
+    });
+    await loadSessionsList();
+  } catch (e) {
+    alert(`删除会话失败: ${e.message}`);
+  }
+}
+
+// 关闭会话详情弹窗
+btnCloseSessionDetail.addEventListener("click", () => {
+  sessionDetailModal.style.display = "none";
+});
+
+sessionDetailModal.querySelector(".modal-backdrop").addEventListener("click", () => {
+  sessionDetailModal.style.display = "none";
+});
+
+// 刷新按钮
+btnRefreshSessions.addEventListener("click", () => {
+  loadSessionsList();
+});
+
+// 页面加载后自动加载会话列表
+document.addEventListener("DOMContentLoaded", () => {
+  loadSessionsList();
+});

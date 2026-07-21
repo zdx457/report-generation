@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>影像报告生成系统</title>
-    <link rel="stylesheet" href="/static/style.css?v=8" />
+    <link rel="stylesheet" href="/static/style.css?v=10" />
   </head>
   <body>
     <div class="app">
@@ -28,6 +28,10 @@
             <span class="sidebar-icon">⚙️</span>
             <span class="sidebar-label">配置</span>
           </button>
+          <button class="sidebar-btn" data-page="monitor" title="会话记录">
+          <span class="sidebar-icon">📊</span>
+          <span class="sidebar-label">记录</span>
+        </button>
         </div>
       </nav>
 
@@ -104,6 +108,9 @@
 
               <div class="status-bar" id="statusBar">
                 <span id="statusText">就绪</span>
+                <span class="context-usage" id="contextUsage" style="display: none;">
+                  上下文使用率: <span id="contextPercent">0</span>%
+                </span>
               </div>
             </div>
           </div>
@@ -396,9 +403,68 @@
             </div>
           </div>
         </div>
+
+        <!-- 监控页面 -->
+        <div class="page" id="pageMonitor">
+          <header class="header">
+            <h1>会话监控</h1>
+            <p class="subtitle">查看和管理所有用户会话</p>
+          </header>
+
+          <div class="monitor-body">
+            <div class="monitor-stats">
+              <div class="monitor-stat">
+                <span class="monitor-stat-label">总会话数</span>
+                <span class="monitor-stat-value" id="monitorTotalSessions">-</span>
+              </div>
+              <div class="monitor-stat">
+                <span class="monitor-stat-label">总对话轮次</span>
+                <span class="monitor-stat-value" id="monitorTotalTurns">-</span>
+              </div>
+              <div class="monitor-stat">
+                <span class="monitor-stat-label">最后更新</span>
+                <span class="monitor-stat-value" id="monitorLastUpdate">-</span>
+              </div>
+            </div>
+
+            <div class="monitor-actions">
+              <button id="btnRefreshSessions" class="btn btn-outline">
+                🔄 刷新列表
+              </button>
+            </div>
+
+            <div class="monitor-sessions">
+              <div class="monitor-sessions-header">
+                <span class="monitor-sessions-col monitor-col-id">会话 ID</span>
+                <span class="monitor-sessions-col monitor-col-title">标题</span>
+                <span class="monitor-sessions-col monitor-col-turns">轮次</span>
+                <span class="monitor-sessions-col monitor-col-time">创建时间</span>
+                <span class="monitor-sessions-col monitor-col-actions">操作</span>
+              </div>
+              <div class="monitor-sessions-list" id="monitorSessionsList">
+                <div class="monitor-empty">加载中...</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 会话详情弹窗 -->
+        <div class="modal" id="sessionDetailModal" style="display: none">
+          <div class="modal-backdrop"></div>
+          <div class="modal-content">
+            <div class="modal-header">
+              <h3>会话详情</h3>
+              <button class="modal-close" id="btnCloseSessionDetail">✕</button>
+            </div>
+            <div class="modal-body" id="sessionDetailBody">
+              <div class="session-detail-info" id="sessionDetailInfo"></div>
+              <div class="session-detail-turns" id="sessionDetailTurns"></div>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
 
-    <script src="/static/app.js?v=21"></script>
+    <script src="/static/app.js?v=23"></script>
   </body>
 </html>

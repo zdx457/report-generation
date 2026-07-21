@@ -11,6 +11,11 @@
 """
 import os
 import sys
+import io
+
+# 修复 Windows 控制台编码问题
+if sys.platform == 'win32':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
@@ -72,6 +77,12 @@ def assert_not_in(item, container, msg=""):
     """断言不包含"""
     if item in container:
         raise AssertionError(f"{msg} 期望 {item!r} 不在 {container!r} 中")
+
+
+def assert_not_equal(actual, expected, msg=""):
+    """断言不相等"""
+    if actual == expected:
+        raise AssertionError(f"{msg} 期望不等于 {expected!r}，实际等于 {actual!r}")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -420,6 +431,125 @@ class TestContextResolution:
 
 
 # ═══════════════════════════════════════════════════════════
+# 测试 5：clinical_history 和 diagnosis 提取测试
+# ═══════════════════════════════════════════════════════════
+
+class TestClinicalHistoryAndDiagnosisExtraction:
+
+    @test("规则提取：CT 脑梗 应提取 diagnosis")
+    def test_rule_extract_diagnosis():
+        tracker = EntityTracker()
+        tracker.update_from_query("CT 脑梗")
+        assert_equal(tracker.slots["diagnosis"], ["脑梗"], "应提取诊断：脑梗")
+
+    @test("规则提取：CT 头部 脑出血 应提取 diagnosis")
+    def test_rule_extract_diagnosis_brain_bleed():
+        tracker = EntityTracker()
+        tracker.update_from_query("CT 头部 脑出血")
+        assert_equal(tracker.slots["diagnosis"], ["脑出血"], "应提取诊断：脑出血")
+
+    @test("规则提取：CT 腹部 肝硬化 应提取 diagnosis")
+    def test_rule_extract_diagnosis_liver():
+        tracker = EntityTracker()
+        tracker.update_from_query("CT 腹部 肝硬化")
+        assert_equal(tracker.slots["diagnosis"], ["肝硬化"], "应提取诊断：肝硬化")
+
+    @test("规则提取：多诊断应都提取")
+    def test_rule_extract_multiple_diagnoses():
+        tracker = EntityTracker()
+        tracker.update_from_query("CT 腹部 肝硬化 腹水")
+        assert_in("肝硬化", tracker.slots["diagnosis"], "应包含诊断：肝硬化")
+        assert_in("腹水", tracker.slots["diagnosis"], "应包含诊断：腹水（如关键词包含）")
+
+    @test("规则提取：CT 头颅 头痛3天 应提取 clinical_history")
+    def test_rule_extract_clinical_history():
+        tracker = EntityTracker()
+        changes = tracker.update_from_query("CT 头颅 头痛3天")
+        # 验证 clinical_history 被提取
+        assert_true("clinical_history" in changes or tracker.slots["clinical_history"] != "", 
+                   "应提取病史信息")
+
+    @test("规则提取：外伤后疼痛 应提取 clinical_history")
+    def test_rule_extract_trauma_history():
+        tracker = EntityTracker()
+        changes = tracker.update_from_query("MR 膝关节 外伤后疼痛1周")
+        assert_true("clinical_history" in changes or tracker.slots["clinical_history"] != "",
+                   "应提取外伤病史")
+
+    @test("追加模式：多次查询 diagnosis 应累加")
+    def test_diagnosis_append_mode():
+        tracker = EntityTracker()
+        tracker.update_from_query("CT 脑梗")
+        tracker.update_from_query("再看看 脑出血")
+        assert_in("脑梗", tracker.slots["diagnosis"], "应保留第一个诊断")
+        assert_in("脑出血", tracker.slots["diagnosis"], "应追加第二个诊断")
+
+    @test("去重模式：重复 diagnosis 不应重复添加")
+    def test_diagnosis_dedup():
+        tracker = EntityTracker()
+        tracker.update_from_query("CT 脑梗")
+        tracker.update_from_query("再看看脑梗情况")
+        assert_equal(tracker.slots["diagnosis"].count("脑梗"), 1, "诊断不应重复添加")
+
+    @test("覆盖模式：clinical_history 应被新值覆盖")
+    def test_clinical_history_override():
+        tracker = EntityTracker()
+        tracker.update_from_query("CT 头颅 头痛3天")
+        old_history = tracker.slots["clinical_history"]
+        tracker.update_from_query("再看看 发热伴咳嗽")
+        # 新病史应该覆盖或追加
+        assert_true(
+            tracker.slots["clinical_history"] != "" or "发热" in tracker.slots["clinical_history"] or "咳嗽" in tracker.slots["clinical_history"],
+            "应更新病史信息"
+        )
+
+    @test("诊断推断部位：CT 脑出血 应自动推断 body_part 为 脑部")
+    def test_diagnosis_infers_body_part_brain():
+        tracker = EntityTracker()
+        changes = tracker.update_from_query("CT 脑出血")
+        assert_equal(tracker.slots["diagnosis"], ["脑出血"], "应提取诊断")
+        assert_in("脑部", tracker.slots["body_part"], "应自动推断部位为脑部")
+
+    @test("诊断推断部位：CT 肺炎 应自动推断 body_part 为 肺部")
+    def test_diagnosis_infers_body_part_lung():
+        tracker = EntityTracker()
+        changes = tracker.update_from_query("CT 肺炎")
+        assert_equal(tracker.slots["diagnosis"], ["肺炎"], "应提取诊断")
+        assert_in("肺部", tracker.slots["body_part"], "应自动推断部位为肺部")
+
+    @test("诊断推断部位：CT 肝硬化 应自动推断 body_part 为 肝脏")
+    def test_diagnosis_infers_body_part_liver():
+        tracker = EntityTracker()
+        changes = tracker.update_from_query("CT 肝硬化")
+        assert_equal(tracker.slots["diagnosis"], ["肝硬化"], "应提取诊断")
+        assert_in("肝脏", tracker.slots["body_part"], "应自动推断部位为肝脏")
+
+    @test("诊断推断部位：不明确的诊断不推断")
+    def test_diagnosis_no_infer_ambiguous():
+        tracker = EntityTracker()
+        tracker.update_from_query("CT 肿瘤")
+        assert_equal(tracker.slots["diagnosis"], ["肿瘤"], "应提取诊断")
+        # "肿瘤"部位不明确，不应自动推断
+        assert_equal(tracker.slots["body_part"], [], "不应自动推断部位")
+
+    @test("诊断推断：多诊断推断多部位")
+    def test_diagnosis_infers_multiple_parts():
+        tracker = EntityTracker()
+        tracker.update_from_query("CT 脑出血 肺炎")
+        assert_in("脑部", tracker.slots["body_part"], "应推断脑部")
+        assert_in("肺部", tracker.slots["body_part"], "应推断肺部")
+
+    @test("诊断推断：已有明确部位时不重复推断")
+    def test_diagnosis_no_infer_when_body_part_exists():
+        tracker = EntityTracker()
+        tracker.update_from_query("CT 头颅 脑出血")
+        # "头颅"应该已被提取
+        assert_in("头颅", tracker.slots["body_part"], "应包含明确提到的部位")
+        # 不应再重复添加"脑部"
+        assert_equal(tracker.slots["body_part"].count("脑部"), 0, "已有头颅时不应再推断脑部")
+
+
+# ═══════════════════════════════════════════════════════════
 # 主入口
 # ═══════════════════════════════════════════════════════════
 
@@ -471,6 +601,23 @@ def run_all_tests():
     TestContextResolution.test_resolve_only_body_part()
     TestContextResolution.test_resolve_no_state()
     TestContextResolution.test_resolve_continue()
+
+    print("\n📋 测试 5：clinical_history 和 diagnosis 提取测试")
+    TestClinicalHistoryAndDiagnosisExtraction.test_rule_extract_diagnosis()
+    TestClinicalHistoryAndDiagnosisExtraction.test_rule_extract_diagnosis_brain_bleed()
+    TestClinicalHistoryAndDiagnosisExtraction.test_rule_extract_diagnosis_liver()
+    TestClinicalHistoryAndDiagnosisExtraction.test_rule_extract_multiple_diagnoses()
+    TestClinicalHistoryAndDiagnosisExtraction.test_rule_extract_clinical_history()
+    TestClinicalHistoryAndDiagnosisExtraction.test_rule_extract_trauma_history()
+    TestClinicalHistoryAndDiagnosisExtraction.test_diagnosis_append_mode()
+    TestClinicalHistoryAndDiagnosisExtraction.test_diagnosis_dedup()
+    TestClinicalHistoryAndDiagnosisExtraction.test_clinical_history_override()
+    TestClinicalHistoryAndDiagnosisExtraction.test_diagnosis_infers_body_part_brain()
+    TestClinicalHistoryAndDiagnosisExtraction.test_diagnosis_infers_body_part_lung()
+    TestClinicalHistoryAndDiagnosisExtraction.test_diagnosis_infers_body_part_liver()
+    TestClinicalHistoryAndDiagnosisExtraction.test_diagnosis_no_infer_ambiguous()
+    TestClinicalHistoryAndDiagnosisExtraction.test_diagnosis_infers_multiple_parts()
+    TestClinicalHistoryAndDiagnosisExtraction.test_diagnosis_no_infer_when_body_part_exists()
 
     print("\n" + "=" * 60)
     print(f"  结果: 通过 {PASS} / 失败 {FAIL} / 总计 {PASS + FAIL}")

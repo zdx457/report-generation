@@ -3,7 +3,6 @@ llms:
   base_url: http://14.22.86.97:11001/v1/chat/completions
   model: qwen36-27b
   api_key: ''
-  max_tokens: 2048
   temperature: 0.3
 - name: qwen36_27b_lora
   base_url: http://14.22.86.97:11001/v1/chat/completions
@@ -12,7 +11,11 @@ llms:
   max_tokens: 2048
   temperature: 0.3
 - name: qwen3.6-plus
-  api_key: ''
+  base_url: https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions
+  model: qwen3.6-plus
+  api_key: sk-6881d846f8f94e57aa64f014d6aac5f0
+  max_tokens: 2048
+  temperature: 0.3
 embeddings:
 - name: bge-m3
   base_url: http://14.22.83.225:11002/v1/embeddings

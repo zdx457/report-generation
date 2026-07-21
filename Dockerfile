@@ -17,6 +17,7 @@ RUN pip install --no-cache-dir -i https://mirrors.aliyun.com/pypi/simple/ --trus
 COPY app/ ./app/
 COPY front/ ./front/
 COPY python_start.py .
+COPY config.yml .
 
 # 创建数据目录
 RUN mkdir -p data app/memory/data

@@ -31,7 +31,7 @@ MODALITY_PATTERNS = [
 
 # 部位关键词（按长度降序，优先匹配长词）
 BODY_PART_PATTERNS = [
-    "颅脑", "头颅", "头部", "大脑",
+    "颅脑", "头颅", "头部", "大脑", "脑部",
     "胸部", "肺部", "胸腔", "肺",
     "腹部", "肝脏", "肝", "胆囊", "胆", "胰腺", "胰", "脾脏", "脾", "肾脏", "肾",
     "盆腔", "子宫", "卵巢", "前列腺", "膀胱",
@@ -59,6 +59,44 @@ SWITCH_PATTERNS = [
     "重新", "换个", "改成别的", "换一个", "不要这个",
     "重新来", "再来", "重新开始",
 ]
+
+# 病史/症状关键词（用于规则兜底提取）
+CLINICAL_HISTORY_PATTERNS = [
+    "头痛", "头晕", "发热", "咳嗽", "胸闷", "胸痛", "腹痛", "腰痛",
+    "外伤", "车祸", "跌倒", "摔伤", "撞伤",
+    "高血压", "糖尿病", "冠心病", "脑梗塞", "脑出血",
+    "手术史", "既往史", "过敏史", "家族史",
+    "疼痛", "肿胀", "麻木", "乏力", "恶心", "呕吐",
+    "天", "周", "月", "年",  # 时间描述词（如"头痛3天"）
+]
+
+# 常见疾病关键词（用于规则兜底提取）
+DIAGNOSIS_PATTERNS = [
+    "脑梗", "脑出血", "脑梗塞", "脑血栓", "脑肿瘤",
+    "肺炎", "肺结核", "肺气肿", "肺癌",
+    "肝硬化", "肝炎", "肝癌", "肝囊肿", "血管瘤",
+    "骨折", "骨裂", "骨肿瘤", "骨质疏松",
+    "肿瘤", "癌症", "囊肿", "息肉", "结节",
+    "炎症", "感染", "出血", "梗塞", "栓塞",
+    "腹水", "积液", "积水",
+]
+
+# 诊断 → 部位映射表（用于自动推断隐含部位）
+DIAGNOSIS_TO_BODY_PART = {
+    # 脑部疾病
+    "脑梗": "脑部", "脑出血": "脑部", "脑梗塞": "脑部", "脑血栓": "脑部", "脑肿瘤": "脑部",
+    # 肺部疾病
+    "肺炎": "肺部", "肺结核": "肺部", "肺气肿": "肺部", "肺癌": "肺部",
+    # 肝脏疾病
+    "肝硬化": "肝脏", "肝炎": "肝脏", "肝癌": "肝脏", "肝囊肿": "肝脏", "血管瘤": "肝脏",
+    # 骨科疾病（需根据上下文判断，默认不映射）
+    # "骨折": None,  # 骨折可能在四肢/脊柱，不明确映射
+    "骨质疏松": "骨骼",
+    # 通用疾病
+    "肿瘤": None, "癌症": None, "囊肿": None, "息肉": None, "结节": None,  # 部位不明确
+    "炎症": None, "感染": None, "出血": None, "梗塞": None, "栓塞": None,  # 部位不明确
+    "腹水": "腹部", "积液": None, "积水": None,
+}
 
 
 class EntityTracker:
@@ -93,24 +131,52 @@ class EntityTracker:
         body_part 支持多部位：新提取的部位追加到列表中，不去重。
 
         Returns:
-            dict: 本次提取到的实体变更 {"modality": "CT", "body_part": ["肝脏"], ...}
+            dict: 本次提取到的实体变更 {"modality": "CT", "body_part": ["肝脏"], "clinical_history": "头痛3天", "diagnosis": ["脑梗"], ...}
         """
         changes = {}
 
         if self._llm_chat is not None:
             extracted = self._extract_llm(query)
             if extracted:
-                modality, body_parts = extracted
+                modality, body_parts, clinical_history, diagnosis_list = extracted
+                
+                # 更新 modality
                 if modality and modality != self.slots["modality"]:
                     self.slots["modality"] = modality
                     changes["modality"] = modality
+                
+                # 更新 body_part（追加模式）
                 if body_parts:
                     new_parts = [p for p in body_parts if p not in self.slots["body_part"]]
                     if new_parts:
                         self.slots["body_part"].extend(new_parts)
                         changes["body_part"] = new_parts
+                
+                # 更新 clinical_history（覆盖模式）
+                if clinical_history and clinical_history != self.slots["clinical_history"]:
+                    self.slots["clinical_history"] = clinical_history
+                    changes["clinical_history"] = clinical_history
+                
+                # 更新 diagnosis（追加模式，去重）
+                if diagnosis_list:
+                    new_diagnoses = [d for d in diagnosis_list if d not in self.slots["diagnosis"]]
+                    if new_diagnoses:
+                        self.slots["diagnosis"].extend(new_diagnoses)
+                        changes["diagnosis"] = new_diagnoses
+                    
+                    # 自动推断隐含部位
+                    inferred_parts = self._infer_body_part_from_diagnosis(diagnosis_list)
+                    if inferred_parts:
+                        new_inferred_parts = []
+                        for p in inferred_parts:
+                            if p not in self.slots["body_part"] and not self._has_explicit_body_part(p, query):
+                                new_inferred_parts.append(p)
+                        if new_inferred_parts:
+                            self.slots["body_part"].extend(new_inferred_parts)
+                            changes["body_part_inferred"] = new_inferred_parts
+                
                 if changes:
-                    logger.debug("LLM实体更新: %s", changes)
+                    logger.debug("LLM 实体更新: %s", changes)
                 return changes
 
         # LLM 不可用或提取失败，回退到规则匹配
@@ -126,13 +192,36 @@ class EntityTracker:
                 self.slots["body_part"].extend(new_parts)
                 changes["body_part"] = new_parts
 
+        extracted_clinical_history = self._extract_clinical_history_rule(query)
+        if extracted_clinical_history and extracted_clinical_history != self.slots["clinical_history"]:
+            self.slots["clinical_history"] = extracted_clinical_history
+            changes["clinical_history"] = extracted_clinical_history
+
+        extracted_diagnoses = self._extract_diagnosis_rule(query)
+        if extracted_diagnoses:
+            new_diagnoses = [d for d in extracted_diagnoses if d not in self.slots["diagnosis"]]
+            if new_diagnoses:
+                self.slots["diagnosis"].extend(new_diagnoses)
+                changes["diagnosis"] = new_diagnoses
+            
+            # 自动推断隐含部位
+            inferred_parts = self._infer_body_part_from_diagnosis(extracted_diagnoses)
+            if inferred_parts:
+                new_inferred_parts = []
+                for p in inferred_parts:
+                    if p not in self.slots["body_part"] and not self._has_explicit_body_part(p, query):
+                        new_inferred_parts.append(p)
+                if new_inferred_parts:
+                    self.slots["body_part"].extend(new_inferred_parts)
+                    changes["body_part_inferred"] = new_inferred_parts
+
         if changes:
             logger.debug("规则实体更新: %s", changes)
 
         return changes
 
-    def _extract_llm(self, query: str) -> Optional[Tuple[Optional[str], Optional[list]]]:
-        """使用 LLM 提取实体，返回 JSON 解析后的 (modality, body_parts)"""
+    def _extract_llm(self, query: str) -> Optional[Tuple[Optional[str], Optional[list], Optional[str], Optional[list]]]:
+        """使用 LLM 提取实体，返回 JSON 解析后的 (modality, body_parts, clinical_history, diagnosis_list)"""
         if self._llm_chat is None:
             return None
 
@@ -150,11 +239,11 @@ class EntityTracker:
             return None
 
     @staticmethod
-    def _parse_json_output(output: str) -> Optional[Tuple[Optional[str], Optional[list]]]:
+    def _parse_json_output(output: str) -> Optional[Tuple[Optional[str], Optional[list], Optional[str], Optional[list]]]:
         """从 LLM 输出中解析 JSON，处理可能的 markdown 代码块包裹
 
         Returns:
-            (modality, body_parts) — body_parts 为部位列表
+            (modality, body_parts, clinical_history, diagnosis_list)
         """
         output = output.strip()
 
@@ -180,14 +269,15 @@ class EntityTracker:
                 logger.debug("未找到有效JSON: %s", output[:100])
                 return None
 
+        # 解析 modality
         modality = data.get("modality")
-        body_part = data.get("body_part")
-
         if modality in ("null", "None", "none", ""):
             modality = None
         if isinstance(modality, str):
             modality = modality.strip()
 
+        # 解析 body_part
+        body_part = data.get("body_part")
         if body_part in ("null", "None", "none", "", []):
             body_parts = []
         elif isinstance(body_part, list):
@@ -198,7 +288,28 @@ class EntityTracker:
         else:
             body_parts = []
 
-        return (modality, body_parts)
+        # 解析 clinical_history
+        clinical_history = data.get("clinical_history")
+        if clinical_history in ("null", "None", "none", ""):
+            clinical_history = ""
+        if isinstance(clinical_history, str):
+            clinical_history = clinical_history.strip()
+        else:
+            clinical_history = ""
+
+        # 解析 diagnosis
+        diagnosis = data.get("diagnosis")
+        if diagnosis in ("null", "None", "none", "", []):
+            diagnosis_list = []
+        elif isinstance(diagnosis, list):
+            diagnosis_list = [d.strip() for d in diagnosis if isinstance(d, str) and d.strip() and d.strip() not in ("null", "None", "none", "")]
+        elif isinstance(diagnosis, str):
+            diagnosis = diagnosis.strip()
+            diagnosis_list = [diagnosis] if diagnosis and diagnosis not in ("null", "None", "none", "") else []
+        else:
+            diagnosis_list = []
+
+        return (modality, body_parts, clinical_history, diagnosis_list)
 
     @staticmethod
     def _extract_modality_rule(query: str) -> Optional[str]:
@@ -220,6 +331,71 @@ class EntityTracker:
                 if not any(pattern in p and pattern != p for p in parts):
                     parts.append(pattern)
         return parts
+
+    @staticmethod
+    def _extract_clinical_history_rule(query: str) -> str:
+        """规则兜底：从查询中提取病史/症状描述"""
+        for pattern in CLINICAL_HISTORY_PATTERNS:
+            if pattern in query:
+                # 简单提取：返回包含关键词的短语
+                idx = query.find(pattern)
+                start = max(0, idx - 5)
+                end = min(len(query), idx + len(pattern) + 10)
+                return query[start:end].strip()
+        return ""
+
+    @staticmethod
+    def _extract_diagnosis_rule(query: str) -> list:
+        """规则兜底：从查询中提取疾病名称"""
+        diagnoses = []
+        for pattern in DIAGNOSIS_PATTERNS:
+            if pattern in query:
+                if not any(pattern in d and pattern != d for d in diagnoses):
+                    diagnoses.append(pattern)
+        return diagnoses
+
+    # 部位语义分组（同组内视为相同部位，避免重复推断）
+    BODY_PART_SYNONYMS = {
+        "脑部": ["颅脑", "头颅", "头部", "大脑", "脑部"],
+        "肺部": ["胸部", "肺部", "胸腔", "肺"],
+        "肝脏": ["腹部", "肝脏", "肝"],
+        "肾脏": ["肾脏", "肾"],
+    }
+
+    @staticmethod
+    def _infer_body_part_from_diagnosis(diagnosis_list: list) -> list:
+        """从诊断列表自动推断隐含部位"""
+        inferred_parts = []
+        for diagnosis in diagnosis_list:
+            body_part = DIAGNOSIS_TO_BODY_PART.get(diagnosis)
+            if body_part and body_part not in inferred_parts:
+                inferred_parts.append(body_part)
+        return inferred_parts
+
+    def _has_explicit_body_part(self, inferred_part: str, query: str) -> bool:
+        """检查用户是否明确提到了部位（不是从疾病名中匹配到的）"""
+        # 先找出 query 中所有匹配的部位词
+        matched_parts = []
+        for pattern in BODY_PART_PATTERNS:
+            if pattern in query:
+                if not any(pattern in p and pattern != p for p in matched_parts):
+                    matched_parts.append(pattern)
+        
+        # 检查是否有同义部位
+        for synonym_group in EntityTracker.BODY_PART_SYNONYMS.values():
+            if inferred_part in synonym_group:
+                # 只有当用户明确提到的是独立的部位词（不是疾病名的一部分）时才阻止推断
+                for part in matched_parts:
+                    if part in synonym_group:
+                        # 检查这个部位是否是独立提到的（前后无汉字连接）
+                        idx = query.find(part)
+                        if idx >= 0:
+                            before_char = query[idx-1] if idx > 0 else ""
+                            after_char = query[idx+len(part)] if idx+len(part) < len(query) else ""
+                            # 如果前后都不是汉字，说明是独立提到的
+                            if not ("\u4e00" <= before_char <= "\u9fff") and not ("\u4e00" <= after_char <= "\u9fff"):
+                                return True
+        return False
 
     def _missing_modality(self, query: str) -> bool:
         """检查查询是否缺少检查类型"""

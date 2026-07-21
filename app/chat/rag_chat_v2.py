@@ -37,9 +37,9 @@ from memory.entity_tracker import EntityTracker
 from memory.short_term import ShortTermMemory
 from memory.long_term import LongTermMemory
 from memory.retriever import MemoryRetriever
+from memory.session_store import SessionStore
 from tools.registry import ToolRegistry, ToolResult
 from prompt.builder import PromptBuilder
-from store import SessionStore
 from rag.rerank import rerank_documents, get_rerank_config
 from rag.retrieval import multi_recall
 from rag.query_rewrite import (
@@ -66,13 +66,102 @@ from data_pipeline.xlsx_slicer import process_file
 
 # ── Web 模式依赖（可选） ──
 try:
-    from fastapi import FastAPI, Request, UploadFile, File
+    from fastapi import FastAPI, Request, UploadFile, File, Query
     from fastapi.responses import StreamingResponse, FileResponse
     from fastapi.staticfiles import StaticFiles
+    from pydantic import BaseModel, Field
+    from typing import Optional, List, Dict, Any
     import uvicorn
     WEB_AVAILABLE = True
 except ImportError:
     WEB_AVAILABLE = False
+
+# =============================================================================
+# API 请求/响应模型
+# =============================================================================
+class ChatRequest(BaseModel):
+    """对话请求"""
+    query: str = Field(..., description="用户输入内容")
+    session_id: str = Field(default="default", description="会话 ID")
+    selected_diagnosis: Optional[str] = Field(default=None, description="选择的诊断（歧义场景）")
+
+class ConfigSaveRequest(BaseModel):
+    """保存配置请求"""
+    config: Dict[str, Any] = Field(..., description="完整的配置对象")
+
+class TestModelRequest(BaseModel):
+    """测试模型连接请求"""
+    params: Dict[str, Any] = Field(..., alias="model_config", description="模型配置（包含 base_url, model, api_key）")
+    model_type: str = Field(default="llms", description="模型类型：llms/embeddings/reranks")
+
+class KBBuildRequest(BaseModel):
+    """构建知识库请求"""
+    rebuild: bool = Field(default=False, description="是否重建（清空现有数据）")
+    batch_size: int = Field(default=16, description="批次大小")
+
+class SessionTitleUpdate(BaseModel):
+    """更新会话标题请求"""
+    title: str = Field(..., description="新的会话标题")
+
+class KBStatusResponse(BaseModel):
+    """知识库状态响应"""
+    total: int = Field(description="知识库文档总数")
+    md_count: int = Field(description="MD 切片文件数")
+    db_path: str = Field(description="数据库路径")
+    metadata_exists: bool = Field(description="metadata.json 是否存在")
+
+class KBFileInfo(BaseModel):
+    """知识库文件信息"""
+    name: str
+    slice_count: int
+    size: int
+    mtime: float
+
+class KBFilesResponse(BaseModel):
+    files: List[KBFileInfo]
+
+class ConfigResponse(BaseModel):
+    config: Dict[str, Any]
+    path: str
+
+class TestModelResponse(BaseModel):
+    success: bool
+    message: str
+
+class SessionResponse(BaseModel):
+    session_id: str
+
+class SessionsListResponse(BaseModel):
+    sessions: List[Dict[str, Any]]
+
+class SessionInfoResponse(BaseModel):
+    current_turns: int
+    entity_slots: Dict[str, Any]
+    has_last_report: bool
+
+class MemoryTurn(BaseModel):
+    round: int
+    user: str
+    assistant: str
+
+class MemoryResponse(BaseModel):
+    turns: List[MemoryTurn]
+    entities: Dict[str, Any]
+    summaries: Any
+    current_turns: int
+    total_turns: int
+    max_rounds: int
+
+class ThinkingResponse(BaseModel):
+    thinking: List[Any]
+
+class ClearSessionRequest(BaseModel):
+    """清空会话请求"""
+    session_id: str = Field(default="default", description="会话 ID")
+
+class StatusResponse(BaseModel):
+    status: str = "ok"
+    message: Optional[str] = None
 
 # =============================================================================
 # 配置
@@ -785,25 +874,56 @@ def run_pipeline(query, session_id, stm, entity_tracker, ltm, client, last_repor
 
     # ── 模糊输入拦截：如果只有模态，没有部位/诊断，且有 last_report，追问用户意图 ──
     if not selected_diagnosis:
-        has_modality = entity_tracker.slots.get("modality") is not None
-        has_body_part = len(entity_tracker.slots.get("body_part", [])) > 0
-        has_diagnosis = len(entity_tracker.slots.get("diagnosis", [])) > 0
         has_report = last_report and last_report[0]
         
-        if has_modality and not has_body_part and not has_diagnosis and has_report:
-            # 输入过于模糊（如只有"CT"），追问用户意图
-            logger.info(f"模糊输入拦截：modality={entity_tracker.slots['modality']}, 无部位/诊断，已有报告")
+        if has_report:
+            # 检查本次查询是否只包含 modality 词（如只输入"CT"）
+            query_has_new_modality = entity_tracker._extract_modality_rule(query) is not None
+            query_has_body_part = len(entity_tracker._extract_body_part_rule(query)) > 0
+            # 检查槽位中的诊断（可能来自歧义选择）
+            slots_has_diagnosis = len(entity_tracker.slots.get("diagnosis", [])) > 0
+            
+            # 只有当查询只包含 modality，且没有任何部位/诊断时，才拦截
+            if query_has_new_modality and not query_has_body_part and not slots_has_diagnosis:
+                # 输入过于模糊（如只有"CT"），追问用户意图
+                logger.info(f"模糊输入拦截：modality={entity_tracker.slots['modality']}, 无部位/诊断，已有报告")
+                clarification_msg = (
+                    f"检测到您只输入了检查类型 '{entity_tracker.slots['modality']}'，但未指定检查部位或诊断。\n\n"
+                    f"请选择您想执行的操作：\n"
+                    f"1. **修改当前报告**：修改已有的报告内容\n"
+                    f"2. **重新检索**：用 '{entity_tracker.slots['modality']}' 重新检索知识库生成新报告\n"
+                    f"3. **补充部位**：如 'CT 头颅'、'CT 腹部' 等\n\n"
+                    f"请明确告知您的意图，或直接输入完整的查询（如 'CT 脑出血'）。"
+                )
+                _emit("message", {"content": clarification_msg})
+                stm.add_turn(session_id, query, clarification_msg)
+                logger.info(f"── run_pipeline 完成：模糊输入追问")
+                return clarification_msg
+
+        # ── 缺少模态拦截：如果有部位/诊断但没有模态，追问检查类型 ──
+        has_body_part = len(entity_tracker.slots.get("body_part", [])) > 0
+        has_diagnosis = len(entity_tracker.slots.get("diagnosis", [])) > 0
+        has_modality = entity_tracker.slots.get("modality") is not None
+        
+        if not has_modality and (has_body_part or has_diagnosis):
+            # 构建提示信息
+            parts = []
+            if has_body_part:
+                parts.append(f"检查部位: {', '.join(entity_tracker.slots['body_part'])}")
+            if has_diagnosis:
+                parts.append(f"诊断: {', '.join(entity_tracker.slots['diagnosis'])}")
+            
+            info_text = "、".join(parts)
             clarification_msg = (
-                f"检测到您只输入了检查类型 '{entity_tracker.slots['modality']}'，但未指定检查部位或诊断。\n\n"
-                f"请选择您想执行的操作：\n"
-                f"1. **修改当前报告**：修改已有的报告内容\n"
-                f"2. **重新检索**：用 '{entity_tracker.slots['modality']}' 重新检索知识库生成新报告\n"
-                f"3. **补充部位**：如 'CT 头颅'、'CT 腹部' 等\n\n"
-                f"请明确告知您的意图，或直接输入完整的查询（如 'CT 脑出血'）。"
+                f"已识别到{info_text}，但未指定检查类型。\n\n"
+                f"请补充检查类型（如 CT、MR、DR、超声等），例如：\n"
+                f"- 'CT 脑出血'\n"
+                f"- 'MR 脑部'\n\n"
+                f"或回复'继续'使用默认检查类型。"
             )
             _emit("message", {"content": clarification_msg})
             stm.add_turn(session_id, query, clarification_msg)
-            logger.info(f"── run_pipeline 完成：模糊输入追问")
+            logger.info(f"── run_pipeline 完成：缺少模态追问")
             return clarification_msg
 
     history = stm.get_history(session_id)
@@ -862,6 +982,14 @@ def run_pipeline(query, session_id, stm, entity_tracker, ltm, client, last_repor
         messages.append({"role": role, "content": content})
 
     messages.append({"role": "user", "content": enhanced})
+
+    # ── 计算上下文使用率 ──
+    total_chars, est_tokens = _estimate_tokens(messages)
+    # 模型上下文窗口估算：max_tokens(512) 是输出限制，输入+输出总 token 约 4096
+    context_window = 4096
+    usage_percent = (est_tokens / context_window) * 100
+    if _emit:
+        _emit("context_usage", {"percent": usage_percent, "tokens": est_tokens, "chars": total_chars})
 
     # ── 第一次 LLM 调用（带 tools） ──
     if _emit:
@@ -1169,12 +1297,11 @@ def web_main(port=8000):
                 "last_ambiguity": [None],
             }
 
-    @app.post("/api/chat")
-    async def chat(request: Request):
-        body = await request.json()
-        query = body.get("query", "").strip()
-        session_id = body.get("session_id", "default")
-        selected_diagnosis = body.get("selected_diagnosis", None)
+    @app.post("/api/chat", summary="对话", description="发送用户输入并获取流式回复")
+    async def chat(request: ChatRequest):
+        query = request.query.strip()
+        session_id = request.session_id
+        selected_diagnosis = request.selected_diagnosis
 
         if not query:
             return {"error": "query 不能为空"}
@@ -1240,8 +1367,12 @@ def web_main(port=8000):
                             title = query[:20] if len(query) > 20 else query
                             store.update_title(session_id, title)
                             logger.info(f"会话标题已更新: {session_id} → {title}")
+                        
+                        # 同步到长期记忆（更新用户偏好）
+                        session["ltm"].sync_from_short_term(stm, session_id, entity_tracker)
+                        logger.info(f"长期记忆已同步: session={session_id}")
                     except Exception as e:
-                        logger.warning("保存会话失败: %s", e)
+                        logger.warning("保存会话/长期记忆失败: %s", e)
                 except Exception as e:
                     logger.error("run_pipeline 执行异常", exc_info=True)
                     _emit_sse("error", {"message": str(e)})
@@ -1270,8 +1401,8 @@ def web_main(port=8000):
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-    @app.get("/api/info")
-    async def info(session_id: str = "default"):
+    @app.get("/api/info", summary="会话信息", description="获取当前会话的轮次、实体槽位和报告状态")
+    async def info(session_id: str = Query(default="default", description="会话 ID")):
         session = _get_or_create_session(session_id)
         session_info = session["stm"].session_info(session_id)
         entity = session["entity_tracker"]
@@ -1281,8 +1412,8 @@ def web_main(port=8000):
             "has_last_report": bool(session["last_report"][0]),
         }
 
-    @app.get("/api/memory")
-    async def memory(session_id: str = "default"):
+    @app.get("/api/memory", summary="记忆信息", description="获取会话的对话历史、实体、摘要等记忆信息")
+    async def memory(session_id: str = Query(default="default", description="会话 ID")):
         session = _get_or_create_session(session_id)
         stm = session["stm"]
         entity = session["entity_tracker"]
@@ -1310,7 +1441,7 @@ def web_main(port=8000):
             "max_rounds": info.get("max_rounds", 5),
         }
 
-    @app.get("/api/kb/status")
+    @app.get("/api/kb/status", summary="知识库状态", description="获取知识库文档总数、切片文件数等信息")
     async def kb_status():
         total = 0
         try:
@@ -1326,7 +1457,7 @@ def web_main(port=8000):
         meta_exists = os.path.exists(metadata_path)
         return {"total": total, "md_count": md_count, "db_path": DB_PATH, "metadata_exists": meta_exists}
 
-    @app.get("/api/kb/files")
+    @app.get("/api/kb/files", summary="知识库文件列表", description="获取已上传的报告模板文件及其切片信息")
     async def kb_files():
         report_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data_pipeline", "report_template")
         slices_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data_pipeline", "xlsx_slices")
@@ -1348,11 +1479,10 @@ def web_main(port=8000):
                     })
         return {"files": files}
 
-    @app.post("/api/kb/build")
-    async def kb_build(request: Request):
-        body = await request.json()
-        rebuild = body.get("rebuild", False)
-        batch_size = body.get("batch_size", 16)
+    @app.post("/api/kb/build", summary="构建知识库", description="从切片文件构建向量数据库")
+    async def kb_build(request: KBBuildRequest):
+        rebuild = request.rebuild
+        batch_size = request.batch_size
         slices_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "app", "data_pipeline", "xlsx_slices")
 
         async def event_stream():
@@ -1380,7 +1510,7 @@ def web_main(port=8000):
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-    @app.post("/api/kb/extract-metadata")
+    @app.post("/api/kb/extract-metadata", summary="提取元数据", description="从报告模板中提取元数据到 metadata.json")
     async def kb_extract_metadata():
         metadata_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data_pipeline", "report_template")
         metadata_path = os.path.join(metadata_dir, "metadata.json")
@@ -1410,7 +1540,7 @@ def web_main(port=8000):
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-    @app.post("/api/kb/upload")
+    @app.post("/api/kb/upload", summary="上传报告模板", description="上传 .xlsx 报告模板文件并自动切片")
     async def kb_upload(file: UploadFile = File(...)):
         if not file.filename.endswith(".xlsx"):
             return {"error": "只支持 .xlsx 文件"}
@@ -1452,35 +1582,33 @@ def web_main(port=8000):
 
         return StreamingResponse(event_stream(), media_type="text/event-stream")
 
-    @app.delete("/api/session")
-    async def delete_session(session_id: str = "default"):
+    @app.delete("/api/session", summary="删除会话", description="删除指定会话及其所有数据")
+    async def delete_session(session_id: str = Query(default="default", description="会话 ID")):
         store.delete_session(session_id)
         return {"status": "ok"}
 
-    @app.post("/api/clear")
-    async def clear_session_post(request: Request):
-        body = await request.json()
-        session_id = body.get("session_id", "default")
+    @app.post("/api/clear", summary="清空会话", description="清空指定会话的内容并重新创建")
+    async def clear_session_post(request: ClearSessionRequest):
+        session_id = request.session_id
         store.delete_session(session_id)
         store.create_session(session_id)
         return {"status": "ok"}
 
-    @app.get("/api/sessions")
+    @app.get("/api/sessions", summary="会话列表", description="获取所有历史会话列表")
     async def list_sessions():
         return {"sessions": store.list_sessions()}
 
-    @app.get("/api/session/thinking")
-    async def get_thinking(session_id: str = "default"):
-        """获取指定会话的思考过程事件"""
+    @app.get("/api/session/thinking", summary="思考过程", description="获取指定会话的思考过程事件记录")
+    async def get_thinking(session_id: str = Query(default="default", description="会话 ID")):
         return {"thinking": store.get_thinking(session_id)}
 
-    @app.post("/api/session/new")
+    @app.post("/api/session/new", summary="创建会话", description="创建一个新会话并返回 session_id")
     async def new_session():
         session_id = SessionStore.generate_session_id()
         store.create_session(session_id)
         return {"session_id": session_id}
 
-    @app.get("/api/config")
+    @app.get("/api/config", summary="获取配置", description="获取当前系统配置（API 密钥会返回掩码）")
     async def get_config():
         config_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), "config.yml")
         if not os.path.exists(config_path):
@@ -1503,10 +1631,9 @@ def web_main(port=8000):
 
         return {"config": config_data, "path": config_path}
 
-    @app.post("/api/config")
-    async def save_config(request: Request):
-        body = await request.json()
-        config_data = body.get("config")
+    @app.post("/api/config", summary="保存配置", description="保存系统配置并重新加载生效")
+    async def save_config(request: ConfigSaveRequest):
+        config_data = request.config
         if config_data is None:
             return {"error": "缺少 config 参数"}
 
@@ -1524,11 +1651,10 @@ def web_main(port=8000):
         reload_config()
         return {"status": "ok", "message": "配置已保存并生效"}
 
-    @app.post("/api/test-model")
-    async def test_model_connection(request: Request):
-        body = await request.json()
-        model_config = body.get("model_config", {})
-        model_type = body.get("model_type", "llms")
+    @app.post("/api/test-model", summary="测试模型连接", description="测试模型 API 连接是否正常", response_model=TestModelResponse)
+    async def test_model_connection(request: TestModelRequest):
+        model_config = request.params
+        model_type = request.model_type
 
         base_url = model_config.get("base_url", "")
         model_name = model_config.get("model", "")
