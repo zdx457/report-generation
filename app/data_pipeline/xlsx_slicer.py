@@ -47,6 +47,10 @@ def process_file(filepath, output_dir, progress_callback=None):
         if progress_callback:
             progress_callback({"level": level, "msg": msg})
 
+    def _sanitize(name):
+        """清理文件名中的特殊字符"""
+        return name.replace("/", "_").replace("\\", "_").replace(" ", "").replace("(", "").replace(")", "")[:30]
+
     basename = os.path.splitext(os.path.basename(filepath))[0]
     _log(f"读取文件: {os.path.basename(filepath)}")
     header, data_rows = xlsx_to_slices(filepath)
@@ -55,10 +59,30 @@ def process_file(filepath, output_dir, progress_callback=None):
         _log(f"跳过空文件: {filepath}", "error")
         return 0
 
+    # 用于跟踪已使用的文件名
+    name_counter = {}
     count = 0
+    
     for i, row in enumerate(data_rows, start=1):
         md_content = slice_to_md(header, row, sheet_name=basename)
-        out_name = f"{basename}_row{i}.md"
+        
+        # 用前四列构建文件名（检查类型、部位、检查项目、诊断结论）
+        cols = []
+        for j in range(min(4, len(row))):
+            col_val = str(row[j]) if row[j] else ""
+            cols.append(_sanitize(col_val))
+        
+        # 构建基础文件名
+        base_name = "_".join(cols) if cols else f"{basename}_row{i}"
+        
+        # 处理重复文件名
+        if base_name in name_counter:
+            name_counter[base_name] += 1
+            out_name = f"{base_name}_{name_counter[base_name]}.md"
+        else:
+            name_counter[base_name] = 0
+            out_name = f"{base_name}.md"
+        
         out_path = os.path.join(output_dir, out_name)
         with open(out_path, "w", encoding="utf-8") as f:
             f.write(md_content)

@@ -1317,6 +1317,7 @@ def web_main(port=8000):
             loop = asyncio.get_event_loop()
             event_queue = queue.Queue()
             thinking_events = []  # 持久化保存思考过程
+            start_time = time.time()  # 记录请求开始时间
 
             def _emit_sse(event_type, data):
                 try:
@@ -1377,6 +1378,9 @@ def web_main(port=8000):
                     logger.error("run_pipeline 执行异常", exc_info=True)
                     _emit_sse("error", {"message": str(e)})
                 finally:
+                    # 计算总耗时并发送
+                    elapsed = time.time() - start_time
+                    _emit_sse("done", {"total_time": round(elapsed, 1)})
                     event_queue.put_nowait("[DONE]")
 
             loop.run_in_executor(None, run)

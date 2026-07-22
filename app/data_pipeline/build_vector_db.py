@@ -92,6 +92,7 @@ def get_embeddings(texts, batch_size=16, progress_callback=None):
             "model": EMBED_MODEL,
             "input": batch,
         }
+        success = False
         for attempt in range(5):
             try:
                 r = requests.post(EMBED_URL, json=payload, timeout=120)
@@ -99,17 +100,20 @@ def get_embeddings(texts, batch_size=16, progress_callback=None):
                 data = r.json()["data"]
                 data.sort(key=lambda x: x["index"])
                 all_embeddings.extend([d["embedding"] for d in data])
+                success = True
                 break
             except Exception as e:
                 if attempt < 4:
                     wait = (attempt + 1) * 5
-                    _log(f"批次 {i//batch_size+1} 失败({e})，{wait}s 后重试...", "error")
+                    # 静默等待，不发送日志到前端
+                    _log(f"向量化进度: {i//batch_size+1}/{(total + batch_size - 1)//batch_size} 批次 (重试中...)", "info")
                     time.sleep(wait)
                 else:
-                    _log(f"批次 {i//batch_size+1} 重试5次仍失败，跳过", "error")
+                    _log(f"批次 {i//batch_size+1} 重试5次仍失败: {e}", "error")
                     all_embeddings.extend([None] * len(batch))
-        done = min(i + batch_size, total)
-        _log(f"向量化进度: {done}/{total} ({done*100//total}%)")
+        if success:
+            done = min(i + batch_size, total)
+            _log(f"向量化进度: {done}/{total} ({done*100//total}%)")
         time.sleep(0.2)
     all_embeddings = [e for e in all_embeddings if e is not None]
     return all_embeddings
@@ -188,9 +192,68 @@ def build_db(input_dir, batch_size=16, rebuild=False, progress_callback=None):
         if progress_callback:
             progress_callback({"level": level, "msg": msg})
 
-    if not os.path.isdir(input_dir):
-        _log(f"输入文件夹不存在: {input_dir}", "error")
-        return
+    # 全量重建：先清空旧切片，然后重新切片
+    if rebuild:
+        _log("全量重建模式：清空旧数据...")
+        
+        # 清空旧切片文件（避免新旧命名方式冲突）
+        if os.path.isdir(input_dir):
+            import shutil
+            _log(f"清空切片目录: {input_dir}")
+            shutil.rmtree(input_dir)
+        
+        # 自动重新切片
+        report_dir = os.path.join(os.path.dirname(input_dir), "report_template")
+        if os.path.isdir(report_dir):
+            xlsx_files = [f for f in os.listdir(report_dir) if f.endswith(".xlsx") and not f.startswith("~$")]
+            if xlsx_files:
+                os.makedirs(input_dir, exist_ok=True)
+                
+                # 动态导入 xlsx_slicer
+                slicer_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xlsx_slicer.py")
+                import importlib.util
+                spec = importlib.util.spec_from_file_location("xlsx_slicer", slicer_path)
+                xlsx_slicer = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(xlsx_slicer)
+                process_file = xlsx_slicer.process_file
+                
+                for fname in xlsx_files:
+                    fpath = os.path.join(report_dir, fname)
+                    _log(f"自动切片: {fname}")
+                    process_file(fpath, input_dir, progress_callback)
+            else:
+                _log(f"在 {report_dir} 中未找到 xlsx 文件", "error")
+                return
+        else:
+            _log(f"报告模板目录不存在: {report_dir}", "error")
+            return
+    elif not os.path.isdir(input_dir):
+        # 增量模式：目录不存在则自动切片
+        _log(f"输入文件夹不存在: {input_dir}，尝试自动切片...")
+        
+        report_dir = os.path.join(os.path.dirname(input_dir), "report_template")
+        if os.path.isdir(report_dir):
+            xlsx_files = [f for f in os.listdir(report_dir) if f.endswith(".xlsx") and not f.startswith("~$")]
+            if xlsx_files:
+                os.makedirs(input_dir, exist_ok=True)
+                
+                slicer_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "xlsx_slicer.py")
+                import importlib.util
+                spec = importlib.util.spec_from_file_location("xlsx_slicer", slicer_path)
+                xlsx_slicer = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(xlsx_slicer)
+                process_file = xlsx_slicer.process_file
+                
+                for fname in xlsx_files:
+                    fpath = os.path.join(report_dir, fname)
+                    _log(f"自动切片: {fname}")
+                    process_file(fpath, input_dir, progress_callback)
+            else:
+                _log(f"在 {report_dir} 中未找到 xlsx 文件", "error")
+                return
+        else:
+            _log(f"报告模板目录不存在: {report_dir}", "error")
+            return
 
     md_files = sorted([f for f in os.listdir(input_dir) if f.endswith(".md")])
     if not md_files:
@@ -200,11 +263,14 @@ def build_db(input_dir, batch_size=16, rebuild=False, progress_callback=None):
     client = MilvusClient(uri=DB_PATH)
 
     if rebuild:
-        _log("全量重建模式：清空旧数据...")
-        if client.has_collection(COLLECTION_NAME):
-            _log(f"删除集合: {COLLECTION_NAME}")
-            client.drop_collection(COLLECTION_NAME)
-            _log("集合已删除")
+        _log("清空向量数据库集合...")
+        # 关闭客户端再删除数据库文件（避免 Windows 文件锁定问题）
+        client.close()
+        if os.path.exists(DB_PATH):
+            _log(f"删除数据库文件: {DB_PATH}")
+            os.remove(DB_PATH)
+        # 重新创建客户端和集合
+        client = MilvusClient(uri=DB_PATH)
         create_collection(client)
         new_files = md_files
         _log(f"将处理全部 {len(new_files)} 个切片文件")

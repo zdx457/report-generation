@@ -1,0 +1,4 @@
+{"query": "CT脑出血", "expected_source": "你的原始excel切片文件名1.md", "tags": "normal"}
+{"query": "肺结节", "expected_source": "你的原始excel切片文件名2.md", "tags": "need_completion", "desc": "测试缺失模态和部位时，能否命中"}
+{"query": "基底节区出血破入脑室", "expected_source": "你的原始excel切片文件名3.md", "tags": "ambiguous", "desc": "测试在易混淆的多个脑出血切片中，精排能否把它排第一"}
+{"query": "左侧大腿骨折", "expected_source": "你的原始excel切片文件名4.md", "tags": "normal"}

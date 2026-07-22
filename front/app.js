@@ -288,6 +288,21 @@ function setKBBtnsDisabled(disabled) {
 }
 
 async function runKBBuild(rebuild) {
+  // 全量重建需要确认
+  if (rebuild) {
+    const confirmed = confirm(
+      "全量重建将执行以下操作：\n\n" +
+      "1. 清空所有已生成的切片文件\n" +
+      "2. 重新对 xlsx 文件进行切片\n" +
+      "3. 删除向量数据库中的所有数据\n" +
+      "4. 重新向量化并入库\n\n" +
+      "此操作不可逆，是否继续？"
+    );
+    if (!confirmed) {
+      return;
+    }
+  }
+
   if (kbAbortController) {
     kbAbortController.abort();
   }
@@ -764,6 +779,17 @@ function handleStreamEvent(event, thinking) {
 
     case "context_usage":
       updateContextUsage(event.percent || 0);
+      break;
+
+    case "done":
+      // 在思考容器底部追加耗时信息（即使已折叠也会保留）
+      if (thinking) {
+        const timeInfo = document.createElement("div");
+        timeInfo.className = "thinking-time-info";
+        timeInfo.style.cssText = "padding:4px 12px;font-size:12px;color:#666;border-top:1px solid #e8e8e8;text-align:right;";
+        timeInfo.textContent = `⏱️ 总耗时：${event.total_time}秒`;
+        thinking.appendChild(timeInfo);
+      }
       break;
   }
 }
