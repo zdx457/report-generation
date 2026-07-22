@@ -63,7 +63,7 @@ def create_refine_report_handler(
         handler: 签名为 (arguments: dict) -> str 的处理函数
     """
 
-    def handler(arguments: dict) -> str:
+    async def handler(arguments: dict) -> str:
         current_report = arguments.get("current_report", "")
         style = arguments.get("style", "")
 
@@ -114,7 +114,7 @@ def create_refine_report_handler(
             if _emit_fn:
                 _emit_fn("status", {"message": "正在重写报告...", "phase": "refining"})
 
-            output = chat_fn(
+            output = await chat_fn(
                 messages,
                 max_tokens=2048,
                 temperature=0.5,

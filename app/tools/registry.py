@@ -8,6 +8,7 @@
 
 import json
 import logging
+import asyncio
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -72,8 +73,8 @@ class ToolRegistry:
         """
         return [t["schema"] for t in self._tools.values()]
 
-    def execute(self, tool_call_id: str, name: str, arguments: dict) -> ToolResult:
-        """执行指定工具，返回 ToolResult（含 is_final 标记）。
+    async def execute(self, tool_call_id: str, name: str, arguments: dict) -> ToolResult:
+        """异步执行指定工具，返回 ToolResult（含 is_final 标记）。
 
         工具 Handler 返回的 JSON 字符串中如果包含 "_is_final": true，
         则该字段会被剥离并设置到 ToolResult.is_final 中。
@@ -97,7 +98,13 @@ class ToolRegistry:
         handler = self._tools[name]["handler"]
         try:
             logger.info("执行工具 [%s] %s: %s", tool_call_id, name, json.dumps(arguments, ensure_ascii=False)[:200])
-            raw_result = handler(arguments)
+            
+            # 支持异步和同步 handler
+            if asyncio.iscoroutinefunction(handler):
+                raw_result = await handler(arguments)
+            else:
+                raw_result = handler(arguments)
+                
             if raw_result is None:
                 logger.warning("工具 [%s] %s 返回了 None", tool_call_id, name)
                 raw_result = json.dumps({"error": "工具未返回结果", "_is_final": False}, ensure_ascii=False)

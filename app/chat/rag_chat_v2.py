@@ -27,6 +27,7 @@ from typing import Optional, Callable, Any
 
 import yaml
 import requests
+from openai import APIConnectionError, APITimeoutError, APIStatusError
 
 # 全局歧义缓存，跨请求存活（按 session_id 索引）
 _ambiguity_cache = {}
@@ -57,6 +58,8 @@ from config import (
     get_rerank_api_key,
     get_max_rounds,
     reload_config,
+    get_llm_client,
+    get_embed_client,
 )
 from prompt import load_prompt
 
@@ -207,13 +210,14 @@ def load_system_prompt():
 
 
 def get_embedding(text):
-    payload = {"model": EMBED_MODEL, "input": text}
-    headers = {"Content-Type": "application/json"}
-    if EMBED_API_KEY:
-        headers["Authorization"] = f"Bearer {EMBED_API_KEY}"
-    r = requests.post(EMBED_URL, headers=headers, json=payload, timeout=30)
-    r.raise_for_status()
-    return r.json()["data"][0]["embedding"]
+    """使用 OpenAI SDK 获取文本向量"""
+    try:
+        client = get_embed_client()
+        response = client.embeddings.create(model=EMBED_MODEL, input=text)
+        return response.data[0].embedding
+    except Exception as e:
+        logger.error(f"[get_embedding] 请求失败: {e}", exc_info=True)
+        raise
 
 
 def _estimate_tokens(messages):
@@ -221,61 +225,63 @@ def _estimate_tokens(messages):
     return total_chars, total_chars // 2
 
 
-@retry()
-def chat_stream(messages, max_tokens=2048, temperature=0.3, _emit=None, debug=False, caller="chat_stream"):
+async def chat_stream(messages, max_tokens=2048, temperature=0.3, _emit=None, debug=False, caller="chat_stream"):
+    """异步流式 LLM 调用，使用 OpenAI SDK。
+
+    Args:
+        messages: 消息列表
+        max_tokens: 最大 token 数
+        temperature: 温度参数
+        _emit: SSE 事件发射器
+        debug: 是否打印调试信息
+        caller: 调用者标识
+
+    Returns:
+        str: 完整生成的文本
+    """
     total_chars, est_tokens = _estimate_tokens(messages)
     if debug:
         logger.info(f"[{caller}] 发送请求: {len(messages)} messages, {total_chars} chars, 估算 ~{est_tokens} tokens")
 
-    payload = {
-        "model": CHAT_MODEL,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "stream": True,
-    }
-    headers = {"Content-Type": "application/json"}
-    if CHAT_API_KEY:
-        headers["Authorization"] = f"Bearer {CHAT_API_KEY}"
-
     try:
-        r = requests.post(CHAT_URL, headers=headers, json=payload, timeout=120, stream=True)
-    except requests.RequestException as e:
-        logger.error(f"[{caller}] 请求失败", exc_info=True)
-        raise
+        client = get_llm_client()
+        stream = await client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stream=True,
+        )
 
-    if not r.ok:
-        try:
-            error_body = r.text[:500]
-        except Exception:
-            error_body = "(无法读取响应体)"
-        logger.error(f"[{caller}] HTTP {r.status_code}: {error_body}")
-        r.raise_for_status()
-
-    full_text = ""
-    token_count = 0
-    for line in r.iter_lines(decode_unicode=True):
-        if not line:
-            continue
-        if line.startswith("data: "):
-            data = line[6:]
-            if data == "[DONE]":
-                break
-            try:
-                chunk = json.loads(data)
-                delta = chunk.get("choices", [{}])[0].get("delta", {})
-                content = delta.get("content", "")
-                if content:
-                    token_count += 1
-                    if _emit:
-                        _emit("token", {"content": content})
-                    full_text += content
-            except json.JSONDecodeError:
+        full_text = ""
+        token_count = 0
+        async for chunk in stream:
+            if not chunk.choices:
                 continue
+            delta = chunk.choices[0].delta
+            content = delta.content
+            if content:
+                token_count += 1
+                if _emit:
+                    _emit("token", {"content": content})
+                full_text += content
 
-    if debug:
-        logger.info(f"[{caller}] 完成: 收到 {token_count} tokens, {len(full_text)} chars")
-    return full_text.strip()
+        if debug:
+            logger.info(f"[{caller}] 完成: 收到 {token_count} tokens, {len(full_text)} chars")
+        return full_text.strip()
+
+    except APIConnectionError as e:
+        logger.error(f"[{caller}] LLM 连接失败: {e}", exc_info=True)
+        raise
+    except APITimeoutError:
+        logger.error(f"[{caller}] LLM 请求超时", exc_info=True)
+        raise
+    except APIStatusError as e:
+        logger.error(f"[{caller}] LLM 返回错误: HTTP {e.status_code} - {e.message}", exc_info=True)
+        raise
+    except Exception as e:
+        logger.error(f"[{caller}] 未知错误: {e}", exc_info=True)
+        raise
 
 @retry()
 def rerank_with_retry(query, documents, top_n=3):
@@ -366,9 +372,8 @@ logging.basicConfig(
 # =============================================================================
 # Tool Calling: 非流式 LLM 调用（支持 tools 参数）
 # =============================================================================
-@retry()
-def chat_with_tools(messages, tools=None, max_tokens=512, temperature=0.3, debug=False):
-    """非流式 LLM 调用，支持 Tool Calling。
+async def chat_with_tools(messages, tools=None, max_tokens=512, temperature=0.3, debug=False):
+    """非流式 LLM 调用，支持 Tool Calling，使用 OpenAI SDK。
 
     当传入 tools 参数时，API 可能返回 tool_calls 而非 content。
     返回 (content, tool_calls) 元组，其中 tool_calls 为列表或 None。
@@ -390,68 +395,60 @@ def chat_with_tools(messages, tools=None, max_tokens=512, temperature=0.3, debug
         logger.info(f"[chat_with_tools] 发送请求: {len(messages)} messages, {total_chars} chars, "
                      f"tools={len(tools) if tools else 0}")
 
-    payload = {
-        "model": CHAT_MODEL,
-        "messages": messages,
-        "max_tokens": max_tokens,
-        "temperature": temperature,
-        "stream": False,
-    }
-
-    if tools:
-        payload["tools"] = tools
-
-    headers = {"Content-Type": "application/json"}
-    if CHAT_API_KEY:
-        headers["Authorization"] = f"Bearer {CHAT_API_KEY}"
-
     try:
-        r = requests.post(CHAT_URL, headers=headers, json=payload, timeout=120)
-    except requests.RequestException as e:
-        logger.error("[chat_with_tools] 请求失败", exc_info=True)
+        client = get_llm_client()
+        response = await client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=messages,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            tools=tools if tools else None,
+        )
+
+        choice = response.choices[0]
+        message = choice.message
+
+        content = message.content or ""
+        raw_tool_calls = message.tool_calls or []
+
+        tool_calls = []
+        if raw_tool_calls:
+            for tc in raw_tool_calls:
+                func_name = tc.function.name
+                func_args_str = tc.function.arguments
+
+                try:
+                    func_args = json.loads(func_args_str)
+                except json.JSONDecodeError:
+                    func_args = {}
+
+                tool_calls.append({
+                    "id": tc.id,
+                    "name": func_name,
+                    "arguments": func_args,
+                })
+
+        if debug:
+            if tool_calls:
+                logger.info(f"[chat_with_tools] 完成: {len(tool_calls)} tool_calls: "
+                             f"{[tc['name'] for tc in tool_calls]}")
+            else:
+                logger.info(f"[chat_with_tools] 完成: {len(content or '')} chars content")
+
+        return content, tool_calls if tool_calls else None
+
+    except APIConnectionError as e:
+        logger.error(f"[chat_with_tools] LLM 连接失败: {e}", exc_info=True)
         raise
-
-    if not r.ok:
-        try:
-            error_body = r.text[:500]
-        except Exception:
-            error_body = "(无法读取响应体)"
-        logger.error(f"[chat_with_tools] HTTP {r.status_code}: {error_body}")
-        r.raise_for_status()
-
-    data = r.json()
-    choice = data.get("choices", [{}])[0]
-    message = choice.get("message", {})
-
-    content = message.get("content", "")
-    raw_tool_calls = message.get("tool_calls", [])
-
-    tool_calls = []
-    if raw_tool_calls:
-        for tc in raw_tool_calls:
-            func_info = tc.get("function", {})
-            func_name = func_info.get("name", "")
-            func_args_str = func_info.get("arguments", "{}")
-
-            try:
-                func_args = json.loads(func_args_str)
-            except json.JSONDecodeError:
-                func_args = {}
-
-            tool_calls.append({
-                "id": tc.get("id", ""),
-                "name": func_name,
-                "arguments": func_args,
-            })
-
-    if debug:
-        if tool_calls:
-            logger.info(f"[chat_with_tools] 完成: {len(tool_calls)} tool_calls: "
-                         f"{[tc['name'] for tc in tool_calls]}")
-        else:
-            logger.info(f"[chat_with_tools] 完成: {len(content or '')} chars content")
-
-    return content, tool_calls if tool_calls else None
+    except APITimeoutError:
+        logger.error(f"[chat_with_tools] LLM 请求超时", exc_info=True)
+        raise
+    except APIStatusError as e:
+        logger.error(f"[chat_with_tools] LLM 返回错误: HTTP {e.status_code} - {e.message}", exc_info=True)
+        raise
+    except Exception as e:
+        logger.error(f"[chat_with_tools] 未知错误: {e}", exc_info=True)
+        raise
 
 
 # =============================================================================
@@ -464,7 +461,7 @@ def chat_with_tools(messages, tools=None, max_tokens=512, temperature=0.3, debug
 # =============================================================================
 # Stage 3A: 结构化提取
 # =============================================================================
-def structure_report(search_result, history, last_report, ltm, entity_tracker, _emit=None):
+async def structure_report(search_result, history, last_report, ltm, entity_tracker, _emit=None):
     """将检索结果 + 上一轮报告(如有) 结构化输出为 JSON"""
     sys_prompt = STRUCTURE_PROMPT
 
@@ -504,7 +501,7 @@ def structure_report(search_result, history, last_report, ltm, entity_tracker, _
     if _emit:
         _emit("status", {"message": "正在生成结构化报告..."})
 
-    output = chat_stream(messages, max_tokens=2048, temperature=0.3, _emit=None, debug=True, caller="structure_report")
+    output = await chat_stream(messages, max_tokens=2048, temperature=0.3, _emit=None, debug=True, caller="structure_report")
 
     report_json = _extract_json(output)
 
@@ -518,7 +515,7 @@ def structure_report(search_result, history, last_report, ltm, entity_tracker, _
 # =============================================================================
 # Stage 3B: 精准编辑
 # =============================================================================
-def edit_report(query, last_report, history, _emit=None):
+async def edit_report(query, last_report, history, _emit=None):
     """根据用户指令修改已有报告"""
     if not last_report or not last_report[0]:
         return {"error": "没有可修改的报告，请先生成一份报告。"}
@@ -543,7 +540,7 @@ def edit_report(query, last_report, history, _emit=None):
     if _emit:
         _emit("status", {"message": "正在修改报告..."})
 
-    output = chat_stream(messages, max_tokens=2048, temperature=0.3, _emit=None, debug=True, caller="edit_report")
+    output = await chat_stream(messages, max_tokens=2048, temperature=0.3, _emit=None, debug=True, caller="edit_report")
 
     new_json = _extract_json(output)
 
@@ -569,7 +566,7 @@ def edit_report(query, last_report, history, _emit=None):
 # =============================================================================
 # Stage 3B-2: 重写报告（REFINE 意图）
 # =============================================================================
-def refine_report(query, last_report, history, ltm, entity_tracker, _emit=None):
+async def refine_report(query, last_report, history, ltm, entity_tracker, _emit=None):
     """根据用户指令重写报告风格/详细程度，不修改医学内容主干"""
     if not last_report or not last_report[0]:
         return {"error": "没有可重写的报告，请先生成一份报告。"}
@@ -606,7 +603,7 @@ def refine_report(query, last_report, history, ltm, entity_tracker, _emit=None):
     if _emit:
         _emit("status", {"message": "正在重写报告..."})
 
-    output = chat_stream(messages, max_tokens=2048, temperature=0.5, _emit=None, debug=True, caller="refine_report")
+    output = await chat_stream(messages, max_tokens=2048, temperature=0.5, _emit=None, debug=True, caller="refine_report")
 
     new_json = _extract_json(output)
 
@@ -632,7 +629,7 @@ def refine_report(query, last_report, history, ltm, entity_tracker, _emit=None):
 # =============================================================================
 # Stage 3C: 闲聊回复
 # =============================================================================
-def chat_reply(query, history, _emit=None):
+async def chat_reply(query, history, _emit=None):
     """直接回复闲聊"""
     messages = [
         {"role": "system", "content": CHAT_SYSTEM_PROMPT},
@@ -645,7 +642,7 @@ def chat_reply(query, history, _emit=None):
     if _emit:
         _emit("status", {"message": "正在回复..."})
 
-    return chat_stream(messages, max_tokens=512, temperature=0.7, _emit=_emit, debug=True, caller="chat_reply")
+    return await chat_stream(messages, max_tokens=512, temperature=0.7, _emit=_emit, debug=True, caller="chat_reply")
 
 
 # =============================================================================
@@ -766,8 +763,8 @@ def _build_tool_registry(
 
     registry = ToolRegistry()
 
-    def _chat_fn(messages, max_tokens=2048, temperature=0.3, _emit=None, debug=False, caller="tool"):
-        return chat_stream(messages, max_tokens=max_tokens, temperature=temperature,
+    async def _chat_fn(messages, max_tokens=2048, temperature=0.3, _emit=None, debug=False, caller="tool"):
+        return await chat_stream(messages, max_tokens=max_tokens, temperature=temperature,
                            _emit=_emit, debug=debug, caller=caller)
 
     def _search_reports_fn(query, _emit=None):
@@ -805,7 +802,7 @@ def _build_tool_registry(
     return registry
 
 
-def run_pipeline(query, session_id, stm, entity_tracker, ltm, client, last_report, _emit, selected_diagnosis=None, last_ambiguity=None):
+async def run_pipeline(query, session_id, stm, entity_tracker, ltm, client, last_report, _emit, selected_diagnosis=None, last_ambiguity=None):
     """Tool Calling 架构主流程
 
     记忆模块集成点：
@@ -996,7 +993,7 @@ def run_pipeline(query, session_id, stm, entity_tracker, ltm, client, last_repor
         _emit("status", {"message": "正在分析请求..."})
 
     logger.info(f"第一次 LLM 调用 (带 tools): {len(messages)} 条消息, tools={[t['function']['name'] for t in tools_schema]}")
-    content, tool_calls = chat_with_tools(
+    content, tool_calls = await chat_with_tools(
         messages,
         tools=tools_schema,
         max_tokens=512,
@@ -1065,7 +1062,7 @@ def run_pipeline(query, session_id, stm, entity_tracker, ltm, client, last_repor
                     )))
                     continue
 
-        result = registry.execute(tc["id"], tool_name, tool_args)
+        result = await registry.execute(tc["id"], tool_name, tool_args)
         tool_results.append((tc["id"], result))
 
         if result.is_final:
@@ -1167,7 +1164,7 @@ def run_pipeline(query, session_id, stm, entity_tracker, ltm, client, last_repor
             _emit("status", {"message": "正在生成回复..."})
 
         logger.info("非最终结果，执行第二次 LLM 调用")
-        final_content, _ = chat_with_tools(
+        final_content, _ = await chat_with_tools(
             messages,
             tools=None,
             max_tokens=1024,
@@ -1314,12 +1311,11 @@ def web_main(port=8000):
         last_ambiguity = session["last_ambiguity"]
 
         async def event_stream():
-            loop = asyncio.get_event_loop()
-            event_queue = queue.Queue()
             thinking_events = []  # 持久化保存思考过程
             start_time = time.time()  # 记录请求开始时间
+            event_queue = asyncio.Queue()
 
-            def _emit_sse(event_type, data):
+            def _emit_sync(event_type, data):
                 try:
                     payload = json.dumps({"type": event_type, **data}, ensure_ascii=False)
                     logger.info(f"── _emit_sse: type={event_type}, len={len(payload)}")
@@ -1329,7 +1325,7 @@ def web_main(port=8000):
                 except Exception:
                     logger.warning("SSE事件入队失败", exc_info=True)
 
-            def run():
+            async def run():
                 try:
                     # 记录本轮对话前的轮次索引
                     info_before = stm.session_info(session_id)
@@ -1338,11 +1334,11 @@ def web_main(port=8000):
                     # 记录本轮前缓存是否已存在，用于判断是否清除
                     cache_existed_before = session_id in _ambiguity_cache
 
-                    result = run_pipeline(
+                    result = await run_pipeline(
                         query, session_id,
                         stm, entity_tracker, session["ltm"], session["client"],
                         last_report,
-                        _emit_sse,
+                        _emit_sync,
                         selected_diagnosis=selected_diagnosis,
                         last_ambiguity=last_ambiguity,
                     )
@@ -1354,7 +1350,6 @@ def web_main(port=8000):
                     if last_ambiguity[0] is not None:
                         _ambiguity_cache[session_id] = last_ambiguity[0]
                         logger.info(f"歧义缓存已同步到全局: session={session_id}")
-                    # 不再自动清除缓存，保留供后续查询匹配
 
                     # ── 持久化：保存对话记录、会话状态和思考过程 ──
                     try:
@@ -1374,20 +1369,25 @@ def web_main(port=8000):
                         logger.info(f"长期记忆已同步: session={session_id}")
                     except Exception as e:
                         logger.warning("保存会话/长期记忆失败: %s", e)
+                        
                 except Exception as e:
                     logger.error("run_pipeline 执行异常", exc_info=True)
-                    _emit_sse("error", {"message": str(e)})
+                    error_payload = json.dumps({"type": "error", "message": str(e)}, ensure_ascii=False)
+                    event_queue.put_nowait(error_payload)
                 finally:
                     # 计算总耗时并发送
                     elapsed = time.time() - start_time
-                    _emit_sse("done", {"total_time": round(elapsed, 1)})
+                    done_payload = json.dumps({"type": "done", "total_time": round(elapsed, 1)}, ensure_ascii=False)
+                    event_queue.put_nowait(done_payload)
                     event_queue.put_nowait("[DONE]")
 
-            loop.run_in_executor(None, run)
+            # 启动后台任务
+            asyncio.create_task(run())
 
+            # 流式推送事件
             while True:
                 try:
-                    event = await loop.run_in_executor(None, event_queue.get, True, 120)
+                    event = await asyncio.wait_for(event_queue.get(), timeout=120)
                     if event == "[DONE]":
                         logger.info("── event_stream(chat): 发送 [DONE]")
                         yield "data: [DONE]\n\n"
@@ -1399,7 +1399,7 @@ def web_main(port=8000):
                     except Exception:
                         logger.info(f"── event_stream(chat): 发送 raw, len={len(event)}")
                     yield f"data: {event}\n\n"
-                except queue.Empty:
+                except asyncio.TimeoutError:
                     logger.info("── event_stream(chat): 队列超时，退出")
                     break
 
@@ -1678,64 +1678,70 @@ def web_main(port=8000):
         if not model_name:
             return {"success": False, "message": "模型名不能为空"}
 
-        headers = {"Content-Type": "application/json"}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-
-        if model_type == "embeddings":
-            payload = {
-                "model": model_name,
-                "input": "你好",
-            }
-        elif model_type == "reranks":
-            payload = {
-                "model": model_name,
-                "query": "测试查询",
-                "documents": ["测试文档"],
-            }
-        else:
-            payload = {
-                "model": model_name,
-                "messages": [{"role": "user", "content": "你好"}],
-                "max_tokens": 16,
-                "temperature": 0.0,
-                "stream": False,
-            }
-
         try:
-            r = requests.post(base_url, headers=headers, json=payload, timeout=15)
-            if r.status_code == 200:
-                data = r.json()
-                if model_type == "embeddings":
-                    emb_data = data.get("data", [])
-                    if emb_data:
-                        dim = len(emb_data[0].get("embedding", []))
-                        return {"success": True, "message": f"连接成功，向量维度: {dim}"}
-                    return {"success": True, "message": "连接成功"}
-                elif model_type == "reranks":
+            if model_type == "embeddings":
+                # 使用 OpenAI SDK 测试 Embedding
+                from openai import OpenAI
+                client = OpenAI(base_url=base_url, api_key=api_key or "not-needed")
+                response = client.embeddings.create(model=model_name, input="你好")
+                emb_data = response.data
+                if emb_data:
+                    dim = len(emb_data[0].embedding)
+                    return {"success": True, "message": f"连接成功，向量维度: {dim}"}
+                return {"success": True, "message": "连接成功"}
+                
+            elif model_type == "reranks":
+                # Rerank 仍使用 requests（OpenAI SDK 不直接支持 rerank）
+                headers = {"Content-Type": "application/json"}
+                if api_key:
+                    headers["Authorization"] = f"Bearer {api_key}"
+                payload = {
+                    "model": model_name,
+                    "query": "测试查询",
+                    "documents": ["测试文档"],
+                }
+                r = requests.post(base_url, headers=headers, json=payload, timeout=15)
+                if r.status_code == 200:
+                    data = r.json()
                     results = data.get("results", [])
                     if results:
                         score = results[0].get("relevance_score", "N/A")
                         return {"success": True, "message": f"连接成功，相关性分数: {score}"}
                     return {"success": True, "message": "连接成功"}
                 else:
-                    choices = data.get("choices", [])
-                    if choices:
-                        reply = choices[0].get("message", {}).get("content", "")
-                        return {"success": True, "message": f"连接成功，返回: {reply[:50]}"}
-                    return {"success": True, "message": "连接成功"}
+                    error_msg = r.text[:200] if r.text else f"HTTP {r.status_code}"
+                    return {"success": False, "message": error_msg}
+                    
             else:
-                error_msg = r.text[:200] if r.text else f"HTTP {r.status_code}"
-                return {"success": False, "message": error_msg}
-        except requests.exceptions.Timeout:
-            logger.warning("知识库上传：连接超时")
-            return {"success": False, "message": "连接超时"}
-        except requests.exceptions.ConnectionError:
-            logger.warning("知识库上传：无法连接到服务器")
-            return {"success": False, "message": "无法连接到服务器"}
+                # 使用 OpenAI SDK 测试 LLM
+                from openai import AsyncOpenAI
+                client = AsyncOpenAI(base_url=base_url, api_key=api_key or "not-needed")
+                response = await client.chat.completions.create(
+                    model=model_name,
+                    messages=[{"role": "user", "content": "你好"}],
+                    max_tokens=16,
+                    temperature=0.0,
+                )
+                choices = response.choices
+                if choices:
+                    reply = choices[0].message.content or ""
+                    return {"success": True, "message": f"连接成功，返回: {reply[:50]}"}
+                return {"success": True, "message": "连接成功"}
+                
         except Exception as e:
-            logger.error("知识库上传失败", exc_info=True)
-            return {"success": False, "message": str(e)}
+            error_msg = str(e)
+            if "timeout" in error_msg.lower() or "timed out" in error_msg.lower():
+                logger.warning("模型测试：连接超时")
+                return {"success": False, "message": "连接超时"}
+            elif "connection" in error_msg.lower():
+                logger.warning("模型测试：无法连接到服务器")
+                return {"success": False, "message": "无法连接到服务器"}
+            else:
+                logger.error("模型测试失败", exc_info=True)
+                # 提取 HTTP 状态码（如果有）
+                if "status_code" in error_msg or "http" in error_msg.lower():
+                    return {"success": False, "message": error_msg[:200]}
+                return {"success": False, "message": error_msg[:200]}
 
     logger.info(f"Web 服务启动: http://localhost:{port}, 模型={CHAT_MODEL}, Embedding={EMBED_MODEL}")
     print(f"\n{'='*60}")
@@ -1803,12 +1809,12 @@ def main():
                 print("🧹 会话已清空\n")
                 continue
 
-            run_pipeline(
+            result = asyncio.run(run_pipeline(
                 user_input, SESSION_ID,
                 stm, entity_tracker, ltm, client,
                 last_report,
                 _emit,
-            )
+            ))
     except KeyboardInterrupt:
         print("\n👋 再见！")
     except Exception as e:

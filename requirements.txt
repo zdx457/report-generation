@@ -6,7 +6,10 @@ python-multipart>=0.0.9
 # 向量数据库
 pymilvus[milvus_lite]>=2.4.0
 
-# HTTP 请求
+# OpenAI SDK（OpenAI 兼容 API 调用）
+openai>=1.0.0
+
+# HTTP 请求（保留用于非 OpenAI 兼容的 HTTP 调用）
 requests>=2.28.0
 
 # Excel 处理

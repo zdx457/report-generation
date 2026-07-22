@@ -13,11 +13,14 @@ import os
 
 import requests
 from dotenv import load_dotenv
-from config import get_rerank_base_url, get_rerank_model, get_rerank_api_key
+from config import get_rerank_base_url, get_rerank_model, get_rerank_api_key, _normalize_base_url
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".env"))
 
-RERANK_URL = get_rerank_base_url()
+
+def _get_rerank_url() -> str:
+    """获取 Rerank URL，自动补全 /rerank 路径"""
+    return _normalize_base_url(get_rerank_base_url(), "/rerank")
 RERANK_MODEL = get_rerank_model()
 SILICONFLOW_API_KEY = get_rerank_api_key()
 
@@ -50,7 +53,7 @@ def rerank_documents(query, documents, top_n=3):
         "top_n": top_n,
         "return_documents": True,
     }
-    r = requests.post(RERANK_URL, headers=headers, json=payload, timeout=30)
+    r = requests.post(_get_rerank_url(), headers=headers, json=payload, timeout=30)
     r.raise_for_status()
     data = r.json()
     return data.get("results", [])
@@ -63,7 +66,7 @@ def get_rerank_config():
         dict: 包含 rerank_url, rerank_model, api_key_configured 三个字段
     """
     return {
-        "rerank_url": RERANK_URL,
+        "rerank_url": _get_rerank_url(),
         "rerank_model": RERANK_MODEL,
         "api_key_configured": bool(SILICONFLOW_API_KEY),
     }
@@ -72,7 +75,7 @@ def get_rerank_config():
 if __name__ == "__main__":
     print("=== Rerank 模块测试 ===")
     config = get_rerank_config()
-    print(f"  Rerank URL: {config['rerank_url']}")
+    print(f"  Rerank URL: {_get_rerank_url()}")
     print(f"  Rerank Model: {config['rerank_model']}")
     print(f"  API Key: {'已配置' if config['api_key_configured'] else '未配置'}")
 

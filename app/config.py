@@ -1,5 +1,6 @@
 import os
 import yaml
+from openai import AsyncOpenAI, OpenAI
 
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _config_path = os.path.join(_project_root, "config.yml")
@@ -174,3 +175,54 @@ def get_metadata_path() -> str:
     if not os.path.isabs(path):
         path = os.path.join(_project_root, path)
     return path
+
+
+# ============================================================
+# OpenAI SDK Client 工厂函数
+# ============================================================
+
+def _normalize_base_url(base_url: str, path_suffix: str) -> str:
+    """标准化 base_url，支持前端只填到 /v1，后端自动补全路径（用于 requests 调用）。
+    
+    注意：OpenAI SDK 不需要调用此函数，SDK 会自动拼接路径。
+    此函数仅用于 requests 直接调用的场景（如 rerank）。
+    
+    规则：
+    - 如果 URL 已包含 path_suffix，直接返回
+    - 如果 URL 以 /v1 结尾但没有 path_suffix，自动补全
+    - 其他情况直接拼接
+    """
+    base_url = base_url.rstrip("/")
+    if path_suffix in base_url:
+        return base_url
+    if base_url.endswith("/v1"):
+        return f"{base_url}{path_suffix}"
+    return f"{base_url}{path_suffix}"
+
+
+def get_llm_client() -> AsyncOpenAI:
+    """动态获取 LLM 的 AsyncOpenAI 客户端（每次读取最新配置）。
+
+    注意：OpenAI SDK 会自动在 base_url 后拼接 /chat/completions，
+    所以 base_url 只需填到 /v1 即可。
+    """
+    base_url = get_llm_base_url().rstrip("/")
+    logger.debug(f"[get_llm_client] base_url={base_url} (SDK 会自动拼接 /chat/completions)")
+    return AsyncOpenAI(
+        base_url=base_url,
+        api_key=get_llm_api_key() or "not-needed",
+    )
+
+
+def get_embed_client() -> OpenAI:
+    """动态获取 Embedding 的 OpenAI 客户端（同步，因为 Embedding 调用量小且简单）。
+    
+    注意：OpenAI SDK 会自动在 base_url 后拼接 /embeddings，
+    所以 base_url 只需填到 /v1 即可。
+    """
+    base_url = get_embed_base_url().rstrip("/")
+    logger.debug(f"[get_embed_client] base_url={base_url} (SDK 会自动拼接 /embeddings)")
+    return OpenAI(
+        base_url=base_url,
+        api_key=get_embed_api_key() or "not-needed",
+    )

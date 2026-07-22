@@ -151,7 +151,7 @@ def create_rag_search_handler(
         handler: 签名为 (arguments: dict) -> str 的处理函数
     """
 
-    def handler(arguments: dict) -> str:
+    async def handler(arguments: dict) -> str:
         query = arguments.get("query", "")
         modality = arguments.get("modality", "")
         body_part = arguments.get("body_part", "")
@@ -259,7 +259,7 @@ def create_rag_search_handler(
                 {"role": "user", "content": user_content},
             ]
 
-            output = chat_fn(
+            output = await chat_fn(
                 messages,
                 max_tokens=2048,
                 temperature=0.3,
