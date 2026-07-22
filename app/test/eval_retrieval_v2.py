@@ -19,7 +19,13 @@ from pymilvus import MilvusClient
 from rag.query_rewrite import parse_query_keywords
 from rag.retrieval import multi_recall
 from rag.rerank import rerank_documents
-from chat.rag_chat_v2 import get_embedding, _infer_part_from_diagnosis, RAG_TOP_K, RERANK_TOP_K
+from chat.llm_client import get_embedding
+from chat.pipeline import RAG_TOP_K, RERANK_TOP_K
+from memory.entity_tracker import DIAGNOSIS_TO_BODY_PART
+
+def _infer_part_from_diagnosis(diagnosis: str) -> str:
+    """从诊断推断部位"""
+    return DIAGNOSIS_TO_BODY_PART.get(diagnosis, "")
 from config import get_collection_name
 
 COLLECTION_NAME = get_collection_name()

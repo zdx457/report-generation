@@ -5,7 +5,9 @@
 ## 核心特性
 
 - **Tool Calling 架构**：LLM 自主决策调用哪个工具（`rag_search` / `edit_report` / `refine_report`），替代硬编码意图分类，架构更灵活可扩展
-- **PromptBuilder 统一拼装**：消除 `rag_tool.py`、`refine_tool.py`、`rag_chat_v2.py` 中重复的 Prompt 拼装代码，LTM 偏好 + Entity 上下文 + 模板 + Last Report 由 `PromptBuilder.build()` 统一管理，拼接顺序和 reasoning 去除逻辑单点维护
+- **OpenAI SDK 集成**：从原生 `requests` 迁移至官方 `openai` SDK，全异步链路（`AsyncOpenAI` + `async for`），支持多模型服务无缝切换
+- **LangSmith 监控**：全面接入 LangSmith 可观测平台，自动追踪 LLM Token 消耗、工具调用耗时、Agent 思考链路，支持按模态/部位筛选日志
+- **PromptBuilder 统一拼装**：消除 `rag_tool.py`、`refine_tool.py`、`pipeline.py` 中重复的 Prompt 拼装代码，LTM 偏好 + Entity 上下文 + 模板 + Last Report 由 `PromptBuilder.build()` 统一管理，拼接顺序和 reasoning 去除逻辑单点维护
 - **三层记忆架构**：Entity Tracker（实体槽位）+ STM（短期记忆）+ LTM（长期偏好），独立解耦
 - **LLM 实体提取**：双引擎机制（LLM JSON 结构化提取优先级 + 规则兜底），关键词按长度降序匹配，支持多部位（如 `CT 肝脏和胆囊` → `body_part: ["肝脏", "胆囊"]`）
 - **意图切换清洗**：切换检查部位时强制清空 STM 和 last_report，杜绝旧病灶残留
@@ -76,11 +78,15 @@
 
 ```
 app/
-├── chat/
-│   ├── rag_chat_v2.py     # ★ 主入口：Tool Calling 架构 + FastAPI Web 服务
-│   ├── rag_chat.py        # 旧版（保留兼容）
-│   ├── chat.py            # 命令行版
-│   └── README.md          # chat 模块说明
+├── chat/                    # ★ 对话模块（模块化重构）
+│   ├── __init__.py          # 包标识
+│   ├── schemas.py           # Pydantic 数据模型（请求/响应 Schema）
+│   ├── utils.py             # 无状态工具函数（retry、JSON提取、报告格式化）
+│   ├── llm_client.py        # 大模型网络请求封装（OpenAI SDK + LangSmith wrapper）
+│   ├── pipeline.py          # Agent 核心编排（检索、工具注册、run_pipeline）
+│   ├── server.py            # FastAPI Web 服务层（所有路由 + web_main）
+│   ├── main.py              # 启动入口（CLI + --web 模式切换）
+│   └── README.md            # chat 模块说明
 ├── tools/                 # ★ 工具模块（Tool Calling）
 │   ├── registry.py        # 工具注册中心（ToolResult 数据类 + OpenAI 兼容 schema）
 │   ├── utils.py           # 工具共用辅助函数（JSON提取）
@@ -166,7 +172,7 @@ python python_start.py
 ### 命令行
 
 ```bash
-python app/chat/rag_chat_v2.py
+python app/chat/main.py
 ```
 
 ## 知识库管理
@@ -453,7 +459,7 @@ case "ambiguous":
 | ---------------- | -------------------------------------------------------------------------------------- | ---------------------- |
 | `rag_tool.py`    | `PromptBuilder.build("structure", ltm_prefs=..., entity_context=..., last_report=...)` | `structure.md`         |
 | `refine_tool.py` | `PromptBuilder.build("refine", ltm_prefs=..., entity_context=...)`                     | `refine.md`            |
-| `rag_chat_v2.py` | `PromptBuilder.build("tool_orchestrator", ltm_prefs=..., entity_context=...)`          | `tool_orchestrator.md` |
+| `pipeline.py`    | `PromptBuilder.build("tool_orchestrator", ltm_prefs=..., entity_context=...)`          | `tool_orchestrator.md` |
 
 拼接顺序（优先级从高到低）：LTM 偏好 → Entity 上下文 → 基础模板 → Last Report（自动去除 `reasoning` 字段），各段用 `\n\n---\n\n` 分隔。
 
@@ -482,7 +488,7 @@ case "ambiguous":
 | "CT 脑出血" | {检查类型:"CT", 部位:""} | {检查类型:"CT", 部位:"头颅"} | 元数据过滤从单条件变为双条件，排除其他部位的"出血"相关记录 |
 | "CT 肺结节" | {检查类型:"CT", 部位:""} | {检查类型:"CT", 部位:"胸部"} | 关键词检索时增加部位过滤，排除腹部/头部的"结节"匹配        |
 
-**实现位置**：`chat/rag_chat_v2.py` 中的 `_infer_part_from_diagnosis()` 函数和 `search_reports()` 的部位补全逻辑。
+**实现位置**：`chat/pipeline.py` 中的 `_infer_part_from_diagnosis()` 函数和 `search_reports()` 的部位补全逻辑。
 
 ### 工具参数 Schema
 
@@ -552,11 +558,12 @@ python app/test/eval_rerank_compare.py -n 50 -k 10 -r 5    # 抽 50 条，向量
 | 向量数据库    | Milvus Lite (pymilvus)  | 轻量级本地向量库           |
 | Embedding     | bge-m3 (1024 维)        | 本地部署，OpenAI 兼容 API  |
 | Rerank        | Qwen3-VL-Reranker-8B    | SiliconFlow 云端 API       |
-| LLM 生成/改写 | Qwen (qwen36-27b)       | 本地部署，OpenAI 兼容 API  |
+| LLM 生成/改写 | Qwen (qwen36-27b)       | 本地部署，OpenAI SDK 调用  |
 | 配置管理      | config.yml + PyYAML     | 环境变量自动覆盖           |
 | 短期记忆      | 内存 OrderedDict        | 轮次淘汰 + 自动摘要        |
 | 会话持久化    | SQLite (Python sqlite3) | 会话数据自动保存，断线恢复 |
 | 向量计算      | NumPy                   | 余弦相似度排序             |
+| 可观测性      | LangSmith               | LLM 调用链路、Token 监控   |
 
 ## 会话持久化
 
@@ -626,3 +633,92 @@ python app/test/eval_rerank_compare.py -n 50 -k 10 -r 5    # 抽 50 条，向量
 - localStorage 是浏览器本地存储，**换浏览器/换电脑/清缓存后消失**
 - 后端 SQLite（`data/sessions.db`）是真正的永久存储
 - 两者互补：localStorage 负责 UI 快照恢复，SQLite 负责跨设备/跨会话恢复
+
+## OpenAI SDK 迁移
+
+项目已从原生 `requests` HTTP 调用迁移至官方 `openai` Python SDK，实现全异步链路。
+
+### 迁移变更
+
+| 原方式                            | 新方式                                                   |
+| --------------------------------- | -------------------------------------------------------- |
+| `requests.post(..., stream=True)` | `await client.chat.completions.create(..., stream=True)` |
+| 手动解析 JSON 字典                | SDK 返回强类型 Chunk 对象                                |
+| 手动拼接 SSE 流                   | `async for chunk in stream` 迭代                         |
+| 同步 `queue.Queue`                | 异步 `asyncio.Queue` + `asyncio.create_task`             |
+
+### Client 工厂模式
+
+为保证"前端修改配置保存即生效"，**不在全局静态初始化 Client**，而是每次调用时动态创建：
+
+```python
+# config.py
+def get_llm_client() -> AsyncOpenAI:
+    return wrappers.wrap_openai(AsyncOpenAI(
+        base_url=get_llm_base_url().rstrip("/"),  # 只需填到 /v1
+        api_key=get_llm_api_key() or "not-needed",
+    ))
+```
+
+### URL 补全规则
+
+前端填写 URL 只需到 `/v1`，后端自动补全：
+
+| 模型类型  | 前端填写                 | 后端处理                               |
+| --------- | ------------------------ | -------------------------------------- |
+| LLM       | `http://x.x.x.x:port/v1` | SDK 自动拼接 `/chat/completions`       |
+| Embedding | `http://x.x.x.x:port/v1` | SDK 自动拼接 `/embeddings`             |
+| Rerank    | `http://x.x.x.x:port/v1` | `_normalize_base_url()` 补全 `/rerank` |
+
+### 依赖
+
+```txt
+openai>=1.0.0        # OpenAI 官方 SDK
+requests>=2.28.0     # 保留用于 Rerank 等非 OpenAI 兼容调用
+```
+
+## LangSmith 可观测性
+
+项目已全面接入 LangSmith 监控平台，自动追踪 LLM 调用链路、Token 消耗和工具执行耗时。
+
+### 埋点位置
+
+| 层级      | 文件                   | 装饰器/Wrapper                  | Trace 名称                  |
+| --------- | ---------------------- | ------------------------------- | --------------------------- |
+| SDK 层    | `config.py`            | `wrappers.wrap_openai()`        | 自动追踪 LLM/Embedding 调用 |
+| Chain 层  | `pipeline.py`          | `@traceable(run_type="chain")`  | `Agent_Main_Pipeline`       |
+| Prompt 层 | `prompt/builder.py`    | `@traceable(run_type="prompt")` | `Build_Medical_Prompt`      |
+| Tool 层   | `tools/rag_tool.py`    | `@traceable(run_type="tool")`   | `Tool_RAG_Search`           |
+| Tool 层   | `tools/edit_tool.py`   | `@traceable(run_type="tool")`   | `Tool_Edit_Report`          |
+| Tool 层   | `tools/refine_tool.py` | `@traceable(run_type="tool")`   | `Tool_Refine_Report`        |
+| Tool 层   | `rag/rerank.py`        | `@traceable(run_type="tool")`   | `SiliconFlow_Rerank`        |
+
+### Metadata 注入
+
+每次请求自动将以下上下文注入 LangSmith，支持后台按条件筛选：
+
+```python
+run_tree.add_metadata({
+    "session_id": session_id,
+    "modality": entity_tracker.slots.get("modality", ""),
+    "body_part": entity_tracker.slots.get("body_part", ""),
+})
+```
+
+### 环境变量
+
+```env
+LANGCHAIN_API_KEY=lsv2_pt_xxx
+LANGCHAIN_ENDPOINT=https://api.smith.langchain.com
+LANGCHAIN_TRACING_V2=true
+LANGCHAIN_PROJECT=Medical-Agent-v2
+```
+
+### 查看监控
+
+访问 [https://smith.langchain.com](https://smith.langchain.com)，进入 `Medical-Agent-v2` 项目即可查看：
+
+- 完整的 Agent 调用链路图
+- 每次 LLM 调用的 Token 消耗和耗时
+- 工具执行的输入/输出和耗时
+- 按 `modality`、`body_part` 筛选特定场景的日志

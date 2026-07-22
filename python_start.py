@@ -7,17 +7,13 @@ app_dir = os.path.join(project_root, "app")
 sys.path.insert(0, app_dir)
 os.chdir(chat_dir)
 
-sys.argv = ["rag_chat_v2.py", "--web"]
+sys.argv = ["main.py", "--web"]
 
 try:
-    import importlib.util
-    spec = importlib.util.spec_from_file_location("rag_chat_v2", os.path.join(chat_dir, "rag_chat_v2.py"))
-    rag_chat_module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(rag_chat_module)
-    rag_chat_module.main()
-except FileNotFoundError:
-    print("错误: rag_chat_v2.py 未找到")
-    sys.exit(1)
+    from chat.main import main
+    main()
 except Exception as e:
     print(f"启动失败: {e}")
+    import traceback
+    traceback.print_exc()
     sys.exit(1)
