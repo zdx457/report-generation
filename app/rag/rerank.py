@@ -14,6 +14,7 @@ import os
 import requests
 from dotenv import load_dotenv
 from config import get_rerank_base_url, get_rerank_model, get_rerank_api_key, _normalize_base_url
+from langsmith import traceable
 
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".env"))
 
@@ -25,6 +26,7 @@ RERANK_MODEL = get_rerank_model()
 SILICONFLOW_API_KEY = get_rerank_api_key()
 
 
+@traceable(run_type="tool", name="SiliconFlow_Rerank")
 def rerank_documents(query, documents, top_n=3):
     """对候选文档进行 Rerank 精排。
 

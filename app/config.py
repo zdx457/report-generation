@@ -1,6 +1,10 @@
 import os
 import yaml
+import logging
 from openai import AsyncOpenAI, OpenAI
+from langsmith import wrappers
+
+logger = logging.getLogger(__name__)
 
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _config_path = os.path.join(_project_root, "config.yml")
@@ -208,10 +212,11 @@ def get_llm_client() -> AsyncOpenAI:
     """
     base_url = get_llm_base_url().rstrip("/")
     logger.debug(f"[get_llm_client] base_url={base_url} (SDK 会自动拼接 /chat/completions)")
-    return AsyncOpenAI(
+    client = AsyncOpenAI(
         base_url=base_url,
         api_key=get_llm_api_key() or "not-needed",
     )
+    return wrappers.wrap_openai(client)
 
 
 def get_embed_client() -> OpenAI:
@@ -222,7 +227,8 @@ def get_embed_client() -> OpenAI:
     """
     base_url = get_embed_base_url().rstrip("/")
     logger.debug(f"[get_embed_client] base_url={base_url} (SDK 会自动拼接 /embeddings)")
-    return OpenAI(
+    client = OpenAI(
         base_url=base_url,
         api_key=get_embed_api_key() or "not-needed",
     )
+    return wrappers.wrap_openai(client)

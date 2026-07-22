@@ -12,6 +12,7 @@ import logging
 from typing import Callable, Optional
 
 from tools.utils import extract_json
+from langsmith import traceable
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,7 @@ def create_edit_report_handler(
         handler: 签名为 (arguments: dict) -> str 的处理函数
     """
 
+    @traceable(run_type="tool", name="Tool_Edit_Report")
     async def handler(arguments: dict) -> str:
         current_report = arguments.get("current_report", "")
         instruction = arguments.get("instruction", "")

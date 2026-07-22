@@ -14,6 +14,7 @@ import json
 import logging
 from typing import List, Optional, Union
 from prompt import load_prompt
+from langsmith import traceable
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +40,7 @@ class PromptBuilder:
     """
 
     @staticmethod
+    @traceable(run_type="prompt", name="Build_Medical_Prompt")
     def build(
         template_name: str,
         ltm_prefs: Optional[Union[str, List[str]]] = None,

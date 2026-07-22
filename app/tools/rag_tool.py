@@ -12,6 +12,7 @@ import re
 from typing import Callable, Optional, List, Dict
 
 from tools.utils import extract_json
+from langsmith import traceable
 
 logger = logging.getLogger(__name__)
 
@@ -151,6 +152,7 @@ def create_rag_search_handler(
         handler: 签名为 (arguments: dict) -> str 的处理函数
     """
 
+    @traceable(run_type="tool", name="Tool_RAG_Search")
     async def handler(arguments: dict) -> str:
         query = arguments.get("query", "")
         modality = arguments.get("modality", "")

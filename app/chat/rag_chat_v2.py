@@ -28,6 +28,8 @@ from typing import Optional, Callable, Any
 import yaml
 import requests
 from openai import APIConnectionError, APITimeoutError, APIStatusError
+from langsmith import traceable
+from langsmith.run_helpers import get_current_run_tree
 
 # 全局歧义缓存，跨请求存活（按 session_id 索引）
 _ambiguity_cache = {}
@@ -802,6 +804,7 @@ def _build_tool_registry(
     return registry
 
 
+@traceable(run_type="chain", name="Agent_Main_Pipeline")
 async def run_pipeline(query, session_id, stm, entity_tracker, ltm, client, last_report, _emit, selected_diagnosis=None, last_ambiguity=None):
     """Tool Calling 架构主流程
 
@@ -1327,6 +1330,17 @@ def web_main(port=8000):
 
             async def run():
                 try:
+                    # ── LangSmith Metadata 注入 ──
+                    run_tree = get_current_run_tree()
+                    if run_tree is not None:
+                        metadata = {
+                            "session_id": session_id,
+                            "modality": entity_tracker.slots.get("modality", ""),
+                            "body_part": entity_tracker.slots.get("body_part", ""),
+                        }
+                        run_tree.add_metadata(metadata)
+                        logger.info(f"LangSmith metadata 已注入: {metadata}")
+
                     # 记录本轮对话前的轮次索引
                     info_before = stm.session_info(session_id)
                     turn_index = info_before.get("total_turns", 0)
